@@ -1,0 +1,9 @@
+{
+  "income": 500000,
+  "subjectId": "1",
+  "credentialHash": "2",
+  "nullifierHash": "3",
+  "policyId": "1001",
+  "epoch": "2026"
+}
+

@@ -1,0 +1,30 @@
+{
+  "name": "zkp",
+  "version": "1.0.0",
+  "description": "ZK-Samvidhan MVP: privacy-preserving eligibility proofs + credential registry on MST testnet",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "deploy:mst": "hardhat run scripts/deploy.js --network mstTestnet",
+    "deploy:verifier:mst": "hardhat run scripts/deployIncomeVerifier.js --network mstTestnet",
+    "deploy:realzk:mst": "hardhat run scripts/deployRealZKGate.js --network mstTestnet",
+    "gate:set-verifier:mst": "hardhat run scripts/setGateVerifier.js --network mstTestnet",
+    "ipfs:pin-json": "node scripts/ipfs/pinJSONToIPFS.js",
+    "ipfs:pin-file": "node scripts/ipfs/pinFileToIPFS.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.2",
+    "dotenv": "^17.4.2",
+    "hardhat": "^2.28.0"
+  },
+  "dependencies": {
+    "axios": "^1.15.2",
+    "circomlib": "^2.0.5",
+    "form-data": "^4.0.5",
+    "snarkjs": "^0.7.6"
+  }
+}
