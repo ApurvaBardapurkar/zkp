@@ -109,10 +109,16 @@ export function getOrCreateIdentitySecret() {
 }
 
 export function getOrCreateIncomeSalt() {
-  let salt = localStorage.getItem("zk_income_salt");
+  return getOrCreateIncomeSaltForYear(new Date().getFullYear());
+}
+
+/** Per academic year — income can change; new salt each epoch. */
+export function getOrCreateIncomeSaltForYear(year) {
+  const key = `zk_income_salt_${year}`;
+  let salt = localStorage.getItem(key);
   if (!salt) {
     salt = randomField();
-    localStorage.setItem("zk_income_salt", salt);
+    localStorage.setItem(key, salt);
   }
   return salt;
 }
@@ -127,7 +133,7 @@ export async function buildZkIdentityBundle({
   domicileMH = 1,
 }) {
   const identitySecret = bytes32ToBigInt(getOrCreateIdentitySecret());
-  const incomeSalt = bytes32ToBigInt(getOrCreateIncomeSalt());
+  const incomeSalt = bytes32ToBigInt(getOrCreateIncomeSaltForYear(epoch));
   const income = BigInt(Math.max(0, Math.floor(Number(incomeINR) || 0)));
   const pid = BigInt(policyId);
   const ep = BigInt(epoch);

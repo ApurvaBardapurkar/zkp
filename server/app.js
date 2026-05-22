@@ -135,17 +135,32 @@ function createApp() {
         subjectId,
         credentialHash,
         incomeCommitment,
+        oneTimeDocs,
+        applicationType,
       } = req.body || {};
       if (!citizenAddress || !programKey || !policyId) {
         return res.status(400).json({ error: "Missing citizenAddress/programKey/policyId" });
       }
       const certCid = String(incomeCertCid || encryptedDocCid || "").trim();
-      const casteCid = String(casteCertCid || "").trim();
+      const casteCid = String(casteCertCid || oneTimeDocs?.casteCertCid || "").trim();
       if (!certCid) {
         return res.status(400).json({ error: "Income certificate is required (upload PDF/image first)." });
       }
       if (!casteCid) {
         return res.status(400).json({ error: "Caste certificate is required (upload PDF/image first)." });
+      }
+      const ot = oneTimeDocs || {};
+      const requiredOneTime = [
+        ["casteCertCid", casteCid, "Caste certificate"],
+        ["rationCardCid", ot.rationCardCid, "Ration card"],
+        ["domicileCertCid", ot.domicileCertCid, "Domicile certificate"],
+        ["capIdCertCid", ot.capIdCertCid, "CAP ID certificate"],
+        ["admissionLetterCid", ot.admissionLetterCid, "Admission letter"],
+      ];
+      for (const [, val, label] of requiredOneTime) {
+        if (!String(val || "").trim()) {
+          return res.status(400).json({ error: `Missing one-time document: ${label}. Upload all documents before submit.` });
+        }
       }
       const store = await readApps();
       const appItem = {
@@ -167,6 +182,9 @@ function createApp() {
         subjectId: subjectId || "",
         credentialHash: credentialHash || "",
         incomeCommitment: incomeCommitment || "",
+        oneTimeDocs: ot,
+        applicationType: applicationType || "first_admission",
+        parentApplicationId: "",
         status: "submitted",
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -177,6 +195,83 @@ function createApp() {
       return res.status(201).json(appItem);
     } catch (e) {
       console.error("POST /applications error:", e);
+      return res.status(500).json({ error: String(e?.message || e) });
+    }
+  });
+
+  app.post("/applications/renewal", async (req, res) => {
+    try {
+      const {
+        citizenAddress,
+        renewalYear,
+        incomeCertCid,
+        incomeCertName,
+        familyAnnualIncome,
+        parentApplicationId,
+        subjectId,
+        credentialHash,
+        incomeCommitment,
+        policyId,
+        programKey,
+      } = req.body || {};
+      if (!citizenAddress || !renewalYear || !incomeCertCid) {
+        return res.status(400).json({ error: "Missing citizenAddress, renewalYear, or incomeCertCid" });
+      }
+      const store = await readApps();
+      const parent =
+        store.applications.find((a) => a.id === parentApplicationId) ||
+        store.applications.find(
+          (a) =>
+            (a.citizenAddress || "").toLowerCase() === String(citizenAddress).toLowerCase() &&
+            a.status === "issued" &&
+            a.applicationType !== "annual_renewal"
+        );
+      if (!parent) {
+        return res.status(400).json({ error: "No issued first-time application found. Complete first admission first." });
+      }
+      const dup = store.applications.find(
+        (a) =>
+          a.applicationType === "annual_renewal" &&
+          String(a.applicationYear) === String(renewalYear) &&
+          (a.citizenAddress || "").toLowerCase() === String(citizenAddress).toLowerCase() &&
+          (a.status === "renewal_submitted" || a.status === "issued")
+      );
+      if (dup) {
+        return res.status(400).json({ error: `Annual income already submitted for year ${renewalYear}.` });
+      }
+      const item = {
+        id: crypto.randomUUID(),
+        citizenAddress: String(citizenAddress).trim(),
+        programKey: programKey || parent.programKey,
+        policyId: policyId || parent.policyId,
+        schemeKey: parent.schemeKey,
+        schemeName: parent.schemeName,
+        department: parent.department,
+        applicationYear: String(renewalYear),
+        applicationType: "annual_renewal",
+        parentApplicationId: parent.id,
+        oneTimeDocs: parent.oneTimeDocs || {},
+        casteCertCid: parent.casteCertCid || parent.oneTimeDocs?.casteCertCid || "",
+        incomeCertCid: String(incomeCertCid).trim(),
+        incomeCertName: incomeCertName || "",
+        encryptedDocCid: String(incomeCertCid).trim(),
+        applicantProfile: {
+          ...(parent.applicantProfile || {}),
+          familyAnnualIncome: String(familyAnnualIncome || parent.applicantProfile?.familyAnnualIncome || ""),
+        },
+        subjectId: subjectId || parent.subjectId || "",
+        credentialHash: credentialHash || "",
+        incomeCommitment: incomeCommitment || "",
+        status: "renewal_submitted",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        issuedTxHash: "",
+      };
+      store.applications.unshift(item);
+      await writeApps(store);
+      return res.status(201).json(item);
+    } catch (e) {
+      console.error("POST /applications/renewal error:", e);
       return res.status(500).json({ error: String(e?.message || e) });
     }
   });
@@ -220,6 +315,12 @@ function createApp() {
       const idx = store.applications.findIndex((a) => a.id === id);
       if (idx === -1) return res.status(404).json({ error: "Not found" });
       if (status) store.applications[idx].status = status;
+      if (status === "issued" && store.applications[idx].applicationType === "annual_renewal") {
+        const parentIdx = store.applications.findIndex((a) => a.id === store.applications[idx].parentApplicationId);
+        if (parentIdx >= 0) {
+          store.applications[parentIdx].lastRenewalYear = store.applications[idx].applicationYear;
+        }
+      }
       if (issuedTxHash !== undefined) store.applications[idx].issuedTxHash = issuedTxHash;
       if (merkleRoot) store.applications[idx].merkleRoot = merkleRoot;
       if (merklePathElements) store.applications[idx].merklePathElements = merklePathElements;

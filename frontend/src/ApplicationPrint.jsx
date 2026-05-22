@@ -1,6 +1,6 @@
 /** Printable MahaDBT-style application summary for student preview and institute review. */
 
-export function ApplicationPrint({ profile, account, epoch, scheme, incomeCertCid, casteCertCid, applicationSnapshotCid }) {
+export function ApplicationPrint({ profile, account, epoch, scheme, incomeCertCid, casteCertCid, oneTimeDocs, applicationSnapshotCid }) {
   const p = profile || {};
   const row = (label, value) => (
     <div className="grid grid-cols-2 gap-x-2 border-b border-slate-100 py-1.5 text-sm">
@@ -60,8 +60,12 @@ export function ApplicationPrint({ profile, account, epoch, scheme, incomeCertCi
       {row("Policy ID (ZK)", scheme?.policyId)}
 
       <div className="mt-4 text-xs font-bold uppercase tracking-wide text-slate-500">Documents (IPFS / Pinata)</div>
-      {row("Income certificate CID", incomeCertCid)}
-      {row("Caste certificate CID", casteCertCid)}
+      {row("Income certificate (this year)", incomeCertCid)}
+      {row("Caste certificate (one-time)", casteCertCid || oneTimeDocs?.casteCert?.cid)}
+      {row("Ration card (one-time)", oneTimeDocs?.rationCard?.cid)}
+      {row("Domicile certificate (one-time)", oneTimeDocs?.domicileCert?.cid)}
+      {row("CAP ID certificate (one-time)", oneTimeDocs?.capIdCert?.cid)}
+      {row("Admission letter (one-time)", oneTimeDocs?.admissionLetter?.cid)}
       {row("Application snapshot CID", applicationSnapshotCid)}
 
       <p className="mt-6 text-xs text-slate-600">
@@ -128,8 +132,19 @@ export function ApplicationDetailPanel({ application, ipfsGatewayUrl }) {
         </div>
       </div>
       <div className="flex flex-wrap gap-3 border-t border-slate-100 pt-3">
-        {link(application.incomeCertCid || application.encryptedDocCid, "Income certificate")}
-        {link(application.casteCertCid, "Caste certificate")}
+        {application.applicationType === "annual_renewal" ? (
+          <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-900">
+            Annual renewal · AY {application.applicationYear}
+          </span>
+        ) : (
+          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-800">First admission</span>
+        )}
+        {link(application.incomeCertCid || application.encryptedDocCid, "Income certificate (year)")}
+        {link(application.casteCertCid || application.oneTimeDocs?.casteCertCid, "Caste certificate")}
+        {link(application.oneTimeDocs?.rationCardCid, "Ration card")}
+        {link(application.oneTimeDocs?.domicileCertCid, "Domicile")}
+        {link(application.oneTimeDocs?.capIdCertCid, "CAP ID")}
+        {link(application.oneTimeDocs?.admissionLetterCid, "Admission letter")}
         {link(application.applicationSnapshotCid, "Application JSON snapshot")}
       </div>
     </div>

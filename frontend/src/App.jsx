@@ -12,6 +12,15 @@ import {
 import { pinFileToIpfs, pinJsonToIpfs } from "./pinataUpload.js";
 import { ApplicationPrint, ApplicationDetailPanel } from "./ApplicationPrint.jsx";
 import { DocumentUploadField } from "./DocumentUploadField.jsx";
+import { OneTimeDocsUpload } from "./OneTimeDocsUpload.jsx";
+import {
+  emptyOneTimeDocs,
+  oneTimeDocsComplete,
+  missingOneTimeLabels,
+  oneTimeDocsToPayload,
+  oneTimeDocsFromApplication,
+  ONE_TIME_DOCUMENTS,
+} from "./documentsConfig.js";
 import { buildZkIdentityBundle, bytes32ToBigInt } from "./zkCrypto.js";
 import {
   appendLeafPoseidon,
@@ -453,13 +462,15 @@ export default function App() {
   });
   const [selectedSchemeKey, setSelectedSchemeKey] = useState("");
   const [showPrintPreview, setShowPrintPreview] = useState(false);
-  const [casteCertCid, setCasteCertCid] = useState("");
-  const [casteCertName, setCasteCertName] = useState("");
+  const [oneTimeDocs, setOneTimeDocs] = useState(emptyOneTimeDocs);
   const [incomeCertFile, setIncomeCertFile] = useState(null);
-  const [casteCertFile, setCasteCertFile] = useState(null);
+  const [renewalIncomeFile, setRenewalIncomeFile] = useState(null);
+  const [renewalIncomeCid, setRenewalIncomeCid] = useState("");
+  const [uploadingRenewalIncome, setUploadingRenewalIncome] = useState(false);
+
+  const casteCertCid = oneTimeDocs.casteCert?.cid || "";
   const [applicationSnapshotCid, setApplicationSnapshotCid] = useState("");
   const [uploadingIncome, setUploadingIncome] = useState(false);
-  const [uploadingCaste, setUploadingCaste] = useState(false);
   const [backendPinataOk, setBackendPinataOk] = useState(null);
   const [issuerStep, setIssuerStep] = useState(0); // 0 verify, 1 upload(optional), 2 issue, 3 done
   const [applications, setApplications] = useState([]);
@@ -543,9 +554,44 @@ export default function App() {
   }, [role, tab, account, hasSubmittedPending, fetchMyApplications]);
 
   const pendingApplications = useMemo(
-    () => (applications || []).filter((a) => (a.status || "submitted") === "submitted"),
+    () =>
+      (applications || []).filter((a) => {
+        const s = a.status || "submitted";
+        return s === "submitted" || s === "renewal_submitted";
+      }),
     [applications]
   );
+
+  const baseIssuedApplication = useMemo(
+    () =>
+      myApplications.find((a) => a.status === "issued" && a.applicationType !== "annual_renewal") ||
+      myApplications.find((a) => a.status === "issued") ||
+      null,
+    [myApplications]
+  );
+
+  const renewalPendingForYear = useMemo(
+    () =>
+      myApplications.some(
+        (a) => a.applicationType === "annual_renewal" && String(a.applicationYear) === String(epoch) && a.status === "renewal_submitted"
+      ),
+    [myApplications, epoch]
+  );
+
+  const renewalIssuedForYear = useMemo(
+    () =>
+      myApplications.find(
+        (a) => a.applicationType === "annual_renewal" && String(a.applicationYear) === String(epoch) && a.status === "issued"
+      ) || null,
+    [myApplications, epoch]
+  );
+
+  const canClaimForYear = useMemo(() => {
+    if (!hasIssuedCredential) return false;
+    if (renewalIssuedForYear) return true;
+    if (String(baseIssuedApplication?.applicationYear) === String(epoch) && baseIssuedApplication?.status === "issued") return true;
+    return false;
+  }, [hasIssuedCredential, renewalIssuedForYear, baseIssuedApplication, epoch]);
 
   const selectedApplication = useMemo(
     () => pendingApplications.find((a) => a.id === selectedAppId) || null,
@@ -712,15 +758,35 @@ export default function App() {
     setToast(null);
   }
 
+  function getActiveIssuedAppForEpoch(year) {
+    const y = String(year ?? epoch);
+    const renewal = myApplications.find(
+      (a) => a.applicationType === "annual_renewal" && String(a.applicationYear) === y && a.status === "issued"
+    );
+    if (renewal) return renewal;
+    const first = baseIssuedApplication;
+    if (first && String(first.applicationYear) === y) return first;
+    return first;
+  }
+
   async function buildZkBundleForClaim(epochOverride) {
-    const certCid = incomeCertCid || studentDocCid || encryptedDocCid || selectedApplication?.incomeCertCid || "";
-    const casteCid = casteCertCid || selectedApplication?.casteCertCid || "";
-    const prof = selectedApplication?.applicantProfile || studentProfile;
+    const ep = epochOverride ?? epoch;
+    const issuedApp = getActiveIssuedAppForEpoch(ep) || selectedApplication || baseIssuedApplication;
+    const ot = oneTimeDocsFromApplication(issuedApp);
+    const certCid =
+      (String(ep) === String(epoch) && renewalIncomeCid) ||
+      issuedApp?.incomeCertCid ||
+      incomeCertCid ||
+      studentDocCid ||
+      encryptedDocCid ||
+      "";
+    const casteCid = ot.casteCert?.cid || issuedApp?.casteCertCid || "";
+    const prof = issuedApp?.applicantProfile || studentProfile;
     const incomeVal = prof?.familyAnnualIncome || proofIncome;
     const bundle = await buildZkIdentityBundle({
       incomeINR: incomeVal,
-      policyId: selectedApplication?.policyId || policyId,
-      epoch: epochOverride ?? epoch,
+      policyId: issuedApp?.policyId || selectedApplication?.policyId || policyId,
+      epoch: ep,
       incomeCertCid: certCid,
       casteCertCid: casteCid,
       caste: prof?.casteCategory || studentProfile?.casteCategory || "OPEN",
@@ -842,21 +908,52 @@ export default function App() {
     setToast({ tone: "success", title: "Scheme selected", message: scheme.name });
   }
 
-  async function uploadCasteCertificate() {
-    if (!casteCertFile) {
-      setToast({ tone: "error", title: "No file", message: "Click “Choose file” under Caste certificate first." });
-      throw new Error("Click “Choose file” for the caste certificate, then Upload to IPFS.");
+  async function uploadRenewalIncomeCertificate() {
+    if (!renewalIncomeFile) {
+      setToast({ tone: "error", title: "No file", message: "Choose the income certificate file for this academic year first." });
+      throw new Error("Choose renewal income certificate file");
     }
-    setUploadingCaste(true);
-    setToast({ tone: "loading", title: "Uploading caste certificate", message: "Pinning to IPFS…" });
+    setUploadingRenewalIncome(true);
     try {
-      const cid = await pinFileToIpfs(PINATA_PROXY_URL, casteCertFile);
-      setCasteCertCid(cid);
-      setCasteCertName(casteCertFile.name);
-      setToast({ tone: "success", title: "Caste certificate uploaded", message: cid });
+      const cid = await pinFileToIpfs(PINATA_PROXY_URL, renewalIncomeFile);
+      setRenewalIncomeCid(cid);
+      setIncomeCertCid(cid);
+      setEncryptedDocCid(cid);
+      setToast({ tone: "success", title: "Annual income certificate uploaded", message: cid });
     } finally {
-      setUploadingCaste(false);
+      setUploadingRenewalIncome(false);
     }
+  }
+
+  async function submitAnnualRenewal() {
+    if (!account) throw new Error("Connect wallet first.");
+    if (!baseIssuedApplication) throw new Error("Complete first admission and credential issuance first.");
+    if (!renewalIncomeCid) throw new Error("Upload income certificate for this academic year first.");
+    const bundle = await buildZkBundleForClaim(epoch);
+    const body = {
+      citizenAddress: account,
+      renewalYear: epoch,
+      incomeCertCid: renewalIncomeCid,
+      incomeCertName: renewalIncomeFile?.name || "",
+      familyAnnualIncome: studentProfile.familyAnnualIncome,
+      parentApplicationId: baseIssuedApplication.id,
+      programKey: baseIssuedApplication.programKey,
+      policyId: baseIssuedApplication.policyId,
+      subjectId: bundle.subjectId,
+      credentialHash: bundle.credentialHash,
+      incomeCommitment: bundle.incomeCommitment,
+    };
+    await fetchJson(`${PINATA_PROXY_URL}/applications/renewal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    setToast({
+      tone: "success",
+      title: "Annual income submitted",
+      message: `Institute will verify income for AY ${epoch} and re-issue your credential. Other documents stay on file (ZK).`,
+    });
+    await fetchMyApplications();
   }
 
   function printApplicationPreview() {
@@ -889,6 +986,27 @@ export default function App() {
     }
   }
 
+  async function prepareCredentialFromApplication(app) {
+    if (!app) throw new Error("Select an application first.");
+    const ot = oneTimeDocsFromApplication(app);
+    const prof = app.applicantProfile || {};
+    const bundle = await buildZkIdentityBundle({
+      incomeINR: prof.familyAnnualIncome || proofIncome,
+      policyId: app.policyId,
+      epoch: app.applicationYear || epoch,
+      incomeCertCid: app.incomeCertCid || app.encryptedDocCid,
+      casteCertCid: ot.casteCert?.cid || app.casteCertCid,
+      caste: prof.casteCategory || "OPEN",
+      domicileMH: prof.domicileMH !== false,
+    });
+    setSubjectId(bundle.subjectId);
+    setCredentialHash(bundle.credentialHash);
+    setIncomeCommitmentHex(bundle.incomeCommitment);
+    setEncryptedDocCid(app.incomeCertCid || app.encryptedDocCid || "");
+    setPolicyId(String(app.policyId));
+    return bundle;
+  }
+
   async function issueCredential() {
     setError("");
     setStatus("Issuing credential on-chain…");
@@ -898,6 +1016,9 @@ export default function App() {
       if (!isAdmin && !isCurrentIssuer) {
         setToast({ tone: "error", title: "Not authorized", message: "You are not an allowed Issuer. Ask admin to allowlist your wallet (Set issuer)." });
         throw new Error("NotIssuer");
+      }
+      if (selectedApplication) {
+        await prepareCredentialFromApplication(selectedApplication);
       }
       if (!isBytes32Hex(subjectId) || !isBytes32Hex(credentialHash)) {
         throw new Error("Load Citizen ID + credential hash from the pending application first.");
@@ -1159,14 +1280,16 @@ export default function App() {
   async function submitScholarshipApplication() {
     if (!account) throw new Error("Connect wallet first.");
     if (hasIssuedCredential) {
-      throw new Error("You already have a credential. Use Annual ZK claim for renewal — no new application or certificate needed until graduation.");
+      throw new Error(
+        "You already completed first admission. For each new academic year: Step 2 → upload only the new income certificate and submit annual renewal (one-time docs stay on file)."
+      );
     }
     const certCid = incomeCertCid || studentDocCid || encryptedDocCid;
     if (!certCid) {
       throw new Error("Upload income certificate to IPFS first (Choose file → Upload).");
     }
-    if (!casteCertCid) {
-      throw new Error("Upload caste certificate to IPFS first (Choose file → Upload). Both documents are required.");
+    if (!oneTimeDocsComplete(oneTimeDocs)) {
+      throw new Error(`Upload all one-time documents: ${missingOneTimeLabels(oneTimeDocs).join(", ")}`);
     }
     if (hasSubmittedPending) {
       throw new Error("You already have a pending application. Wait for institute review.");
@@ -1185,7 +1308,7 @@ export default function App() {
           applicationYear: epoch,
           scheme: selectedMahadbtScheme,
           applicantProfile: { ...studentProfile, wallet: account },
-          documents: { incomeCertCid: certCid, casteCertCid },
+          documents: { incomeCertCid: certCid, ...oneTimeDocsToPayload(oneTimeDocs).oneTimeDocs },
         },
         pinataMetadata: { name: `application-${account}-${epoch}` },
       });
@@ -1198,7 +1321,7 @@ export default function App() {
       policyId,
       epoch: epoch || defaultAcademicYear(),
       incomeCertCid: certCid,
-      casteCertCid: casteCertCid || "",
+      casteCertCid: oneTimeDocs.casteCert?.cid || "",
       caste: studentProfile?.casteCategory || "OPEN",
       domicileMH: studentProfile?.domicileMH !== false,
     });
@@ -1216,9 +1339,9 @@ export default function App() {
       encryptedDocCid: certCid,
       incomeCertCid: certCid,
       incomeCertName: incomeCertName || incomeCertFile?.name || "",
-      casteCertCid: casteCertCid || "",
-      casteCertName: casteCertName || "",
+      ...oneTimeDocsToPayload(oneTimeDocs),
       applicationYear: epoch || defaultAcademicYear(),
+      applicationType: "first_admission",
       applicantProfile: { ...studentProfile, wallet: account },
       applicationSnapshotCid: snapshotCid || "",
       subjectId: zkBundle.subjectId,
@@ -1599,7 +1722,7 @@ export default function App() {
                                 <div className="flex flex-wrap items-center justify-between gap-2">
                                   <div className="font-semibold text-slate-900">{a.schemeName || a.programKey}</div>
                                   <div className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-900 border border-amber-200">
-                                    {a.status || "submitted"}
+                                    {a.applicationType === "annual_renewal" ? `Renewal ${a.applicationYear}` : "First admission"} · {a.status || "submitted"}
                                   </div>
                                 </div>
                                 <div className="mt-1 text-xs text-slate-600">
@@ -1971,8 +2094,52 @@ export default function App() {
                       </Field>
                     </div>
                     {hasIssuedCredential ? (
-                      <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-slate-800">
-                        Credential already issued. Skip documents — continue to annual ZK claim for year <strong>{epoch}</strong>.
+                      <div className="mt-3 space-y-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-slate-800">
+                        <div>
+                          <strong>Annual renewal (AY {epoch})</strong> — upload only a new <strong>income certificate</strong> and
+                          updated family income. Ration card, domicile, CAP ID, admission letter, and caste certificate stay on file
+                          from your first admission (used in ZK proof, not re-uploaded).
+                        </div>
+                        {baseIssuedApplication?.oneTimeDocs ? (
+                          <div className="text-xs text-slate-600">
+                            One-time docs on file: {ONE_TIME_DOCUMENTS.map((d) => d.label).join(" · ")}
+                          </div>
+                        ) : null}
+                        <Field label={`Family annual income (₹) for AY ${epoch}`}>
+                          <Input
+                            value={studentProfile.familyAnnualIncome}
+                            onChange={(e) => setStudentProfile((p) => ({ ...p, familyAnnualIncome: e.target.value }))}
+                          />
+                        </Field>
+                        <DocumentUploadField
+                          label={`Income certificate (Tahsildar) — academic year ${epoch}`}
+                          required
+                          file={renewalIncomeFile}
+                          onFileSelect={(f) => {
+                            setRenewalIncomeFile(f);
+                            setRenewalIncomeCid("");
+                          }}
+                          cid={renewalIncomeCid}
+                          uploading={uploadingRenewalIncome}
+                          onUpload={() => uploadRenewalIncomeCertificate().catch((e) => setError(String(e?.message || e)))}
+                          tone="amber"
+                        />
+                        {renewalPendingForYear ? (
+                          <div className="rounded-lg border border-amber-300 bg-amber-100/80 px-3 py-2 text-xs">
+                            Income submitted for {epoch} — waiting for institute to verify and re-issue credential.
+                          </div>
+                        ) : renewalIssuedForYear ? (
+                          <div className="rounded-lg border border-emerald-300 bg-emerald-100/80 px-3 py-2 text-xs">
+                            Income verified for {epoch}. Continue to ZK claim.
+                          </div>
+                        ) : null}
+                        <Button
+                          type="button"
+                          disabled={!renewalIncomeCid || renewalPendingForYear}
+                          onClick={() => submitAnnualRenewal().catch((e) => setError(String(e?.message || e)))}
+                        >
+                          Submit annual income for verification
+                        </Button>
                       </div>
                     ) : null}
                     <div className="mt-4 flex justify-between">
@@ -2169,45 +2336,34 @@ export default function App() {
                         Backend cannot upload: <span className="font-mono">{PINATA_PROXY_URL}</span> has no PINATA_JWT. Set it in server <code>.env</code> or Vercel (zkp-neon) and restart.
                       </div>
                     ) : null}
-                    <div className="mt-3 grid gap-3">
-                      <DocumentUploadField
-                        label="Income certificate (Tahsildar)"
-                        required
-                        file={incomeCertFile}
-                        onFileSelect={(f) => {
-                          setIncomeCertFile(f);
-                          setIncomeCertCid("");
-                          if (f) setToast({ tone: "success", title: "Income file selected", message: f.name });
-                        }}
-                        cid={incomeCertCid}
-                        uploading={uploadingIncome}
-                        onUpload={() => uploadIncomeCertificate().catch((e) => setError(String(e?.message || e)))}
-                        tone="amber"
+                    <div className="mt-3 space-y-4">
+                      <div className="rounded-xl border border-amber-200 bg-amber-50/50 p-3">
+                        <div className="text-xs font-bold uppercase text-amber-900">Income certificate — this academic year ({epoch})</div>
+                        <p className="mt-1 text-xs text-slate-600">Required every year (income may change). Upload fresh certificate for AY {epoch}.</p>
+                        <div className="mt-2">
+                          <DocumentUploadField
+                            label={`Income certificate (Tahsildar) — ${epoch}`}
+                            required
+                            file={incomeCertFile}
+                            onFileSelect={(f) => {
+                              setIncomeCertFile(f);
+                              setIncomeCertCid("");
+                              if (f) setToast({ tone: "success", title: "Income file selected", message: f.name });
+                            }}
+                            cid={incomeCertCid}
+                            uploading={uploadingIncome}
+                            onUpload={() => uploadIncomeCertificate().catch((e) => setError(String(e?.message || e)))}
+                            tone="amber"
+                          />
+                        </div>
+                      </div>
+                      <OneTimeDocsUpload
+                        docs={oneTimeDocs}
+                        setDocs={setOneTimeDocs}
+                        pinataProxyUrl={PINATA_PROXY_URL}
+                        onError={setError}
+                        onToast={setToast}
                       />
-                      {incomeCertCid ? (
-                        <a className="text-xs font-semibold text-blue-700" href={ipfsGatewayUrl(incomeCertCid)} target="_blank" rel="noreferrer">
-                          Preview income certificate on IPFS →
-                        </a>
-                      ) : null}
-                      <DocumentUploadField
-                        label="Caste certificate"
-                        required
-                        file={casteCertFile}
-                        onFileSelect={(f) => {
-                          setCasteCertFile(f);
-                          setCasteCertCid("");
-                          if (f) setToast({ tone: "success", title: "Caste file selected", message: f.name });
-                        }}
-                        cid={casteCertCid}
-                        uploading={uploadingCaste}
-                        onUpload={() => uploadCasteCertificate().catch((e) => setError(String(e?.message || e)))}
-                        tone="slate"
-                      />
-                      {casteCertCid ? (
-                        <a className="text-xs font-semibold text-blue-700" href={ipfsGatewayUrl(casteCertCid)} target="_blank" rel="noreferrer">
-                          Preview caste certificate on IPFS →
-                        </a>
-                      ) : null}
                     </div>
                     <div className="mt-4 flex flex-wrap gap-2">
                       <Button
@@ -2226,12 +2382,12 @@ export default function App() {
                         Preview / Print application
                       </Button>
                       <Button
-                        disabled={!incomeCertCid || !casteCertCid || hasSubmittedPending}
+                        disabled={!incomeCertCid || !oneTimeDocsComplete(oneTimeDocs) || hasSubmittedPending}
                         title={
                           !incomeCertCid
-                            ? "Upload income certificate (Choose file → Upload)"
-                            : !casteCertCid
-                              ? "Upload caste certificate (Choose file → Upload)"
+                            ? "Upload income certificate for this year"
+                            : !oneTimeDocsComplete(oneTimeDocs)
+                              ? "Upload all one-time documents"
                               : undefined
                         }
                         onClick={() => submitScholarshipApplication().catch((e) => setError(String(e?.message || e)))}
@@ -2255,6 +2411,7 @@ export default function App() {
                     scheme={selectedMahadbtScheme}
                     incomeCertCid={incomeCertCid}
                     casteCertCid={casteCertCid}
+                    oneTimeDocs={oneTimeDocs}
                     applicationSnapshotCid={applicationSnapshotCid}
                   />
                 ) : null}
@@ -2382,13 +2539,15 @@ export default function App() {
                             .then(() => setCitizenStep(7))
                             .catch((e) => setError(String(e?.message || e)))
                         }
-                        disabled={!hasIssuedCredential || claimedEpochs[Number(epoch)]}
+                        disabled={!canClaimForYear || claimedEpochs[Number(epoch)]}
                         title={
                           !hasIssuedCredential
                             ? "Claim is enabled only after the institute issues your credential."
-                            : claimedEpochs[Number(epoch)]
-                              ? `You already claimed for ${epoch}.`
-                              : undefined
+                            : !canClaimForYear
+                              ? `Submit and get institute approval for ${epoch} income first`
+                              : claimedEpochs[Number(epoch)]
+                                ? `You already claimed for ${epoch}.`
+                                : undefined
                         }
                       >
                         Submit annual claim ({epoch})

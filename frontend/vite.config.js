@@ -14,6 +14,11 @@ export default defineConfig({
     global: 'globalThis',
   },
   optimizeDeps: {
-    include: ['buffer', 'circomlibjs'],
+    include: ['buffer', 'circomlibjs', 'snarkjs'],
+  },
+  build: {
+    commonjsOptions: {
+      transformMixedEsModules: true,
+    },
   },
 })
