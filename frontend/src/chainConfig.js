@@ -1,8 +1,10 @@
 /**
  * Single source of truth for MST testnet V2 contracts.
- * Env vars override defaults (required on Vercel). Defaults match deployments/scholarship-v2.json.
+ * Env vars override defaults on Vercel (scholarship-hazel).
  */
-import deployment from "../../deployments/scholarship-v2.json";
+const DEFAULT_REGISTRY_V2 = "0x2eFAde234C17318E56a2F4021347D5930136188c";
+const DEFAULT_GATE_V2 = "0x5421baDaeA328eAbcdefD4BAa4F930d85F749330";
+const DEFAULT_VERIFIER_V2 = "0xb96dE41d804bb6ef6482DDC54b512cBdd6868aD5";
 
 export const MST_RPC_URL = "https://testnetrpc.mstblockchain.com";
 export const MST_EXPLORER = "https://testnet.mstscan.com";
@@ -10,10 +12,9 @@ export const MST_CHAIN_ID_DEC = 91562037;
 export const MST_CHAIN_ID_HEX = "0x05752B65";
 
 export const REGISTRY_ADDRESS =
-  import.meta.env.VITE_REGISTRY_ADDRESS || deployment.registryV2;
-export const GATE_ADDRESS =
-  import.meta.env.VITE_GATE_ADDRESS || deployment.gateV2;
-export const VERIFIER_ADDRESS = deployment.verifier;
+  import.meta.env.VITE_REGISTRY_ADDRESS || DEFAULT_REGISTRY_V2;
+export const GATE_ADDRESS = import.meta.env.VITE_GATE_ADDRESS || DEFAULT_GATE_V2;
+export const VERIFIER_ADDRESS = DEFAULT_VERIFIER_V2;
 
 export const registryAbi = [
   "function admin() view returns (address)",
@@ -54,7 +55,7 @@ export function shortAddr(addr) {
 export async function assertChainConfig(ethers, readProvider) {
   if (REGISTRY_ADDRESS.toLowerCase() === GATE_ADDRESS.toLowerCase()) {
     throw new Error(
-      `VITE_GATE_ADDRESS must not equal VITE_REGISTRY_ADDRESS. Registry=${REGISTRY_ADDRESS} Gate must be ${deployment.gateV2}`
+      `VITE_GATE_ADDRESS must not equal VITE_REGISTRY_ADDRESS. Registry=${REGISTRY_ADDRESS} Gate must be ${DEFAULT_GATE_V2}`
     );
   }
   const gate = new ethers.Contract(GATE_ADDRESS, gateAbi, readProvider);
