@@ -633,7 +633,7 @@ export default function App() {
 
         let sid = subjectId;
         if (role === "citizen") {
-          sid = await deriveSubjectIdFromConnectedWallet();
+          sid = await deriveSubjectIdFromConnectedWallet(addr);
         } else {
           sid = isBytes32Hex(subjectId)
             ? subjectId
@@ -799,8 +799,9 @@ export default function App() {
     return bundle;
   }
 
-  async function deriveSubjectIdFromConnectedWallet() {
-    if (!account) throw new Error("Connect wallet first.");
+  async function deriveSubjectIdFromConnectedWallet(walletAddress) {
+    const addr = walletAddress || account;
+    if (!addr) throw new Error("Connect wallet first.");
     const bundle = await buildZkBundleForClaim(epoch);
     return bundle.subjectId;
   }

@@ -122,7 +122,7 @@ export async function pushLeafToServer(proxyUrl, leaf) {
   const r = await fetch(`${proxyUrl}/merkle/leaf`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ leaf: String(leafBigInt ?? leaf) }),
+    body: JSON.stringify({ leaf: String(leaf) }),
   });
   const data = await r.json();
   if (!r.ok) throw new Error(data?.error || "Merkle update failed");
