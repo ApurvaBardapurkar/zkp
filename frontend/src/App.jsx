@@ -1,6 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ethers } from "ethers";
 import * as snarkjs from "snarkjs";
+import {
+  CASTE_CATEGORIES,
+  RELIGIONS,
+  filterEligibleSchemes,
+  schemeToProgram,
+  DEFAULT_STUDENT_PROFILE,
+  validateProfileForApply,
+} from "./mahadbtSchemes.js";
+import { pinFileToIpfs, pinJsonToIpfs } from "./pinataUpload.js";
+import { ApplicationPrint, ApplicationDetailPanel } from "./ApplicationPrint.jsx";
+import { DocumentUploadField } from "./DocumentUploadField.jsx";
 
 const MST_CHAIN_ID_DEC = 91562037;
 const MST_CHAIN_ID_HEX = "0x05752B65"; // 91562037
@@ -82,8 +93,21 @@ const registryAbi = [
 
 const gateAbi = [
   "function verifyAndClaim(uint256[2] a, uint256[2][2] b, uint256[2] c, uint256[5] input) external",
+  "function claimed(bytes32 subjectId, uint256 policyId, uint256 epoch) view returns (bool)",
   "event VerifiedAndClaimed(bytes32 indexed subjectId, bytes32 indexed nullifierHash, uint256 indexed policyId, uint256 epoch, address caller)",
 ];
+
+/** Academic years for annual renewal claims (one on-chain claim per year). */
+const ACADEMIC_YEARS = [2026, 2027, 2028, 2029];
+
+function defaultAcademicYear() {
+  return String(new Date().getFullYear());
+}
+
+function ipfsGatewayUrl(cid) {
+  if (!cid) return "";
+  return `https://gateway.pinata.cloud/ipfs/${cid}`;
+}
 
 const PINATA_PROXY_URL = import.meta.env.VITE_PINATA_PROXY_URL || "http://localhost:8787";
 
@@ -168,6 +192,10 @@ function decodeCustomErrorSelector(sel) {
     "0xb9934cda": { title: "Credential mismatch", message: "The credential hash you’re using doesn’t match what’s stored on-chain." }, // CredentialMismatch()
     "0xcad2ae02": { title: "Already claimed", message: "This nullifier was already used. Generate a new nullifier and try again." }, // NullifierAlreadyUsed()
     "0x09bde339": { title: "Invalid proof", message: "The ZK proof did not verify. Check inputs and try again." }, // InvalidProof()
+    "0x8e4a5fd1": {
+      title: "Already claimed this year",
+      message: "You already submitted a ZK claim for this academic year. Pick another year (e.g. 2027) or wait until the next period.",
+    }, // AlreadyClaimedForEpoch() — verify on-chain if selector changes after redeploy
   };
   return map[s] || null;
 }
@@ -273,6 +301,31 @@ async function encryptFileAesGcm(file, passphrase) {
       originalSize: file.size,
     },
   };
+}
+
+async function decryptFileAesGcm(blob, passphrase) {
+  const packed = new Uint8Array(await blob.arrayBuffer());
+  const header = new TextDecoder().decode(packed.slice(0, 4));
+  if (header !== "ZKS1") throw new Error("Not a ZKS1 encrypted file.");
+  const salt = packed.slice(4, 20);
+  const iv = packed.slice(20, 32);
+  const cipher = packed.slice(32);
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(passphrase),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  const key = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 210_000, hash: "SHA-256" },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+  const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipher);
+  return new Blob([plainBuf], { type: "application/octet-stream" });
 }
 
 function Card({ title, subtitle, children }) {
@@ -389,12 +442,35 @@ export default function App() {
   const [threshold, setThreshold] = useState("800000");
   const [nullifierHash, setNullifierHash] = useState("0x" + "03".padStart(64, "0"));
   const [policyId, setPolicyId] = useState("1001");
-  const [epoch, setEpoch] = useState(String(new Date().getFullYear()));
+  const [epoch, setEpoch] = useState(defaultAcademicYear());
+  const [incomeCertCid, setIncomeCertCid] = useState("");
+  const [incomeCertName, setIncomeCertName] = useState("");
+  const [incomeCertPreviewUrl, setIncomeCertPreviewUrl] = useState("");
+  const [issuerViewPassphrase, setIssuerViewPassphrase] = useState("");
+  const [claimedEpochs, setClaimedEpochs] = useState({});
   const [programKey, setProgramKey] = useState("PANJABRAO_HOSTEL");
   const [selectedFile, setSelectedFile] = useState(null);
   const [passphrase, setPassphrase] = useState("");
   const [attachEncryptedDoc, setAttachEncryptedDoc] = useState(false);
-  const [citizenStep, setCitizenStep] = useState(0); // 0 scheme, 1 submit, 2 identity, 3 zk, 4 status
+  const [citizenStep, setCitizenStep] = useState(0);
+  const [studentProfile, setStudentProfile] = useState(() => {
+    try {
+      const s = localStorage.getItem("zk_student_profile");
+      return s ? { ...DEFAULT_STUDENT_PROFILE, ...JSON.parse(s) } : { ...DEFAULT_STUDENT_PROFILE };
+    } catch {
+      return { ...DEFAULT_STUDENT_PROFILE };
+    }
+  });
+  const [selectedSchemeKey, setSelectedSchemeKey] = useState("");
+  const [showPrintPreview, setShowPrintPreview] = useState(false);
+  const [casteCertCid, setCasteCertCid] = useState("");
+  const [casteCertName, setCasteCertName] = useState("");
+  const [incomeCertFile, setIncomeCertFile] = useState(null);
+  const [casteCertFile, setCasteCertFile] = useState(null);
+  const [applicationSnapshotCid, setApplicationSnapshotCid] = useState("");
+  const [uploadingIncome, setUploadingIncome] = useState(false);
+  const [uploadingCaste, setUploadingCaste] = useState(false);
+  const [backendPinataOk, setBackendPinataOk] = useState(null);
   const [issuerStep, setIssuerStep] = useState(0); // 0 verify, 1 upload(optional), 2 issue, 3 done
   const [applications, setApplications] = useState([]);
   const [myApplications, setMyApplications] = useState([]);
@@ -404,6 +480,7 @@ export default function App() {
   // History
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [backendPersistence, setBackendPersistence] = useState(null);
 
   const explorerLinks = useMemo(
     () => ({
@@ -458,6 +535,13 @@ export default function App() {
     const data = await fetchJson(`${PINATA_PROXY_URL}/applications?citizenAddress=${account}`);
     setMyApplications(data.applications || []);
   }, [account, fetchJson]);
+
+  useEffect(() => {
+    fetch(`${PINATA_PROXY_URL}/health`)
+      .then((r) => r.json())
+      .then((h) => setBackendPersistence(h?.persistence ?? "unknown"))
+      .catch(() => setBackendPersistence("unreachable"));
+  }, []);
 
   const hasSubmittedPending = useMemo(
     () => myApplications.some((a) => (a.status || "submitted") === "submitted"),
@@ -517,6 +601,20 @@ export default function App() {
         const has = stored && stored !== "0x0000000000000000000000000000000000000000000000000000000000000000";
         setHasIssuedCredential(Boolean(has));
         if (has) setCredentialHash(stored);
+        setSubjectId(sid);
+        if (role === "citizen") {
+          const gate = new ethers.Contract(GATE_GROTH16_ADDRESS, gateAbi, readProvider);
+          const pid = BigInt(policyId || "0");
+          const out = {};
+          for (const y of ACADEMIC_YEARS) {
+            try {
+              out[y] = await gate.claimed(sid, pid, BigInt(y));
+            } catch {
+              out[y] = false;
+            }
+          }
+          setClaimedEpochs(out);
+        }
       } catch {
         setHasIssuedCredential(false);
       }
@@ -532,8 +630,68 @@ export default function App() {
   }
 
   const selectedProgram = useMemo(() => SCHOLARSHIP_PROGRAMS.find((p) => p.key === programKey) || SCHOLARSHIP_PROGRAMS[0], [programKey]);
-  const citizenSteps = useMemo(() => ["Choose scheme", "Submit application", "Your ID", "ZK proof", "Status"], []);
-  const issuerSteps = useMemo(() => ["Verify documents", "Upload (optional)", "Issue credential", "Done"], []);
+  const citizenSteps = useMemo(
+    () =>
+      hasIssuedCredential
+        ? ["Connect wallet", "Academic year", "Renewal", "Citizen ID", "ZK claim", "Status"]
+        : [
+            "Connect wallet",
+            "Academic year",
+            "Profile",
+            "Eligible schemes",
+            "Apply & print",
+            "Citizen ID",
+            "ZK claim",
+            "Status",
+          ],
+    [hasIssuedCredential]
+  );
+
+  const citizenStepperIndex = useMemo(() => {
+    if (!hasIssuedCredential) return citizenStep;
+    if (citizenStep <= 1) return citizenStep;
+    if (citizenStep === 5) return 2;
+    if (citizenStep === 6) return 3;
+    if (citizenStep === 7) return 4;
+    return 0;
+  }, [citizenStep, hasIssuedCredential]);
+
+  const eligibleSchemes = useMemo(() => filterEligibleSchemes(studentProfile), [studentProfile]);
+
+  const selectedMahadbtScheme = useMemo(
+    () => eligibleSchemes.find((s) => s.key === selectedSchemeKey) || eligibleSchemes[0] || null,
+    [eligibleSchemes, selectedSchemeKey]
+  );
+
+  useEffect(() => {
+    localStorage.setItem("zk_student_profile", JSON.stringify(studentProfile));
+  }, [studentProfile]);
+
+  useEffect(() => {
+    if (citizenStep !== 4 || hasIssuedCredential) return;
+    fetch(`${PINATA_PROXY_URL}/health`)
+      .then((r) => r.json())
+      .then((h) => setBackendPinataOk(Boolean(h.pinata)))
+      .catch(() => setBackendPinataOk(false));
+  }, [citizenStep, hasIssuedCredential]);
+  const issuerSteps = useMemo(() => ["Pending applications", "Review certificate", "Issue credential", "Done"], []);
+
+  const proofIncome = useMemo(() => {
+    const limit = Number(selectedProgram?.incomeLimitINR || threshold || 800000);
+    return Math.max(1, Math.floor(limit * 0.5));
+  }, [selectedProgram, threshold]);
+
+  const selectedAppCertCid = useMemo(() => {
+    if (!selectedApplication) return "";
+    return selectedApplication.incomeCertCid || selectedApplication.encryptedDocCid || "";
+  }, [selectedApplication]);
+
+  const selectedAppCasteCid = useMemo(() => {
+    if (!selectedApplication) return "";
+    return selectedApplication.casteCertCid || "";
+  }, [selectedApplication]);
+
+  const selectedAppDocsReady = Boolean(selectedAppCertCid && selectedAppCasteCid);
 
   function chooseRole(nextRole) {
     localStorage.setItem("zk_role", nextRole);
@@ -591,6 +749,55 @@ export default function App() {
     return h;
   }
 
+  async function refreshClaimedEpochs() {
+    if (!isBytes32Hex(subjectId)) return {};
+    const readProvider = new ethers.JsonRpcProvider(MST_RPC_URL);
+    const gate = new ethers.Contract(GATE_GROTH16_ADDRESS, gateAbi, readProvider);
+    const pid = BigInt(policyId || "0");
+    const out = {};
+    for (const y of ACADEMIC_YEARS) {
+      try {
+        out[y] = await gate.claimed(subjectId, pid, BigInt(y));
+      } catch {
+        out[y] = false;
+      }
+    }
+    setClaimedEpochs(out);
+    return out;
+  }
+
+  async function uploadIncomeCertificate() {
+    setError("");
+    const file = incomeCertFile;
+    if (!file) {
+      setToast({ tone: "error", title: "No file", message: "Click “Choose file” under Income certificate first." });
+      throw new Error("Click “Choose file” for the income certificate, then Upload to IPFS.");
+    }
+    setUploadingIncome(true);
+    setStatus("Uploading income certificate…");
+    setToast({ tone: "loading", title: "Uploading", message: `Sending to ${PINATA_PROXY_URL}…` });
+    try {
+      const cid = await pinFileToIpfs(PINATA_PROXY_URL, file);
+      setIncomeCertCid(cid);
+      setIncomeCertName(file.name);
+      setStudentDocCid(cid);
+      setEncryptedDocCid(cid);
+      setIncomeCertPreviewUrl(ipfsGatewayUrl(cid));
+      setStatus(`Income certificate uploaded. CID: ${cid}`);
+      setToast({ tone: "success", title: "Uploaded", message: cid });
+    } finally {
+      setUploadingIncome(false);
+    }
+  }
+
+  async function loadIssuerCertificatePreview(cid) {
+    if (!cid) {
+      setIncomeCertPreviewUrl("");
+      return;
+    }
+    setIncomeCertPreviewUrl(ipfsGatewayUrl(cid));
+  }
+
   async function checkIfCredentialExistsForConnectedWallet() {
     if (!account) throw new Error("Connect wallet first.");
     const sid = deriveSubjectIdFromConnectedWallet();
@@ -601,8 +808,47 @@ export default function App() {
     setHasIssuedCredential(Boolean(has));
     if (has) {
       setCredentialHash(stored);
+      setCitizenStep(5);
     }
+    await refreshClaimedEpochs().catch(() => {});
     return { subjectId: sid, has, stored };
+  }
+
+  function applyToScheme(scheme) {
+    const p = schemeToProgram(scheme);
+    setSelectedSchemeKey(scheme.key);
+    setProgramKey(p.key);
+    setPolicyId(String(p.policyId));
+    setThreshold(String(p.incomeLimitINR));
+    setStudentProfile((prof) => ({
+      ...prof,
+      department: prof.department || scheme.department || "",
+    }));
+    setCitizenStep(4);
+    setShowPrintPreview(false);
+    setToast({ tone: "success", title: "Scheme selected", message: scheme.name });
+  }
+
+  async function uploadCasteCertificate() {
+    if (!casteCertFile) {
+      setToast({ tone: "error", title: "No file", message: "Click “Choose file” under Caste certificate first." });
+      throw new Error("Click “Choose file” for the caste certificate, then Upload to IPFS.");
+    }
+    setUploadingCaste(true);
+    setToast({ tone: "loading", title: "Uploading caste certificate", message: "Pinning to IPFS…" });
+    try {
+      const cid = await pinFileToIpfs(PINATA_PROXY_URL, casteCertFile);
+      setCasteCertCid(cid);
+      setCasteCertName(casteCertFile.name);
+      setToast({ tone: "success", title: "Caste certificate uploaded", message: cid });
+    } finally {
+      setUploadingCaste(false);
+    }
+  }
+
+  function printApplicationPreview() {
+    setShowPrintPreview(true);
+    window.setTimeout(() => window.print(), 300);
   }
 
   async function setIssuer() {
@@ -718,7 +964,7 @@ export default function App() {
     }
     const stored = await registryRead.credentialHashBySubject(subjectId);
     if (stored === "0x0000000000000000000000000000000000000000000000000000000000000000") {
-      setCitizenStep(4);
+      setCitizenStep(7);
       throw new Error(
         "Scholarship credential NOT issued for your Citizen ID yet.\n\nFix: submit your application (Citizen Step 2), wait for institute issuance, then return here.\n\nIssuer: select the pending application → Issue credential."
       );
@@ -739,11 +985,21 @@ export default function App() {
       throw new Error("This nullifierHash is already used. Change it (must be unique per claim).");
     }
 
+    const gateRead = new ethers.Contract(GATE_GROTH16_ADDRESS, gateAbi, readProvider);
+    const epochNum = BigInt(epoch || "0");
+    if (!ACADEMIC_YEARS.map(String).includes(String(epoch))) {
+      throw new Error(`Pick a valid academic year: ${ACADEMIC_YEARS.join(", ")}.`);
+    }
+    const alreadyEpoch = await gateRead.claimed(subjectId, BigInt(policyId), epochNum);
+    if (alreadyEpoch) {
+      throw new Error(`You already claimed for academic year ${epoch}. Select ${Number(epoch) + 1} or another open year.`);
+    }
+
     setStatus("Generating ZK proof in browser… (this can take a bit)");
     setToast({ tone: "loading", title: "Generating proof", message: "Creating a Groth16 proof in your browser..." });
 
     const input = {
-      income: Number(income),
+      income: proofIncome,
       subjectId: BigInt(subjectId).toString(),
       credentialHash: BigInt(credentialHash).toString(),
       nullifierHash: BigInt(nullifierHash).toString(),
@@ -771,9 +1027,16 @@ export default function App() {
     setLastTx(tx.hash);
     setToast({ tone: "loading", title: "Tx sent", message: "Waiting for confirmation…", href: txLink(tx.hash), hrefLabel: "View tx" });
     await tx.wait();
-    setStatus("Verified + claimed (nullifier consumed).");
+    setStatus(`Verified + claimed for academic year ${epoch}.`);
     setLastSuccess(tx.hash);
-    setToast({ tone: "success", title: "Claimed successfully", message: "Eligibility verified with ZK. Claim recorded on-chain.", href: txLink(tx.hash), hrefLabel: "View proof tx" });
+    await refreshClaimedEpochs().catch(() => {});
+    setToast({
+      tone: "success",
+      title: "Claimed successfully",
+      message: `Annual eligibility claim recorded for ${epoch}. Income was not re-disclosed.`,
+      href: txLink(tx.hash),
+      hrefLabel: "View proof tx",
+    });
   }
 
   async function refreshHistory() {
@@ -822,12 +1085,56 @@ export default function App() {
 
   async function submitScholarshipApplication() {
     if (!account) throw new Error("Connect wallet first.");
-    setToast({ tone: "loading", title: "Submitting application", message: "Sending application for institute verification…" });
+    if (hasIssuedCredential) {
+      throw new Error("You already have a credential. Use Annual ZK claim for renewal — no new application or certificate needed until graduation.");
+    }
+    const certCid = incomeCertCid || studentDocCid || encryptedDocCid;
+    if (!certCid) {
+      throw new Error("Upload income certificate to IPFS first (Choose file → Upload).");
+    }
+    if (!casteCertCid) {
+      throw new Error("Upload caste certificate to IPFS first (Choose file → Upload). Both documents are required.");
+    }
+    if (hasSubmittedPending) {
+      throw new Error("You already have a pending application. Wait for institute review.");
+    }
+    const missing = validateProfileForApply(studentProfile);
+    if (missing.length) {
+      throw new Error(`Complete your profile first: ${missing.join(", ")}`);
+    }
+    setToast({ tone: "loading", title: "Submitting application", message: "Pinning application snapshot + queue…" });
+    let snapshotCid = applicationSnapshotCid;
+    try {
+      snapshotCid = await pinJsonToIpfs(PINATA_PROXY_URL, {
+        pinataContent: {
+          schema: "zk-samvidhan/application@1",
+          createdAt: new Date().toISOString(),
+          applicationYear: epoch,
+          scheme: selectedMahadbtScheme,
+          applicantProfile: { ...studentProfile, wallet: account },
+          documents: { incomeCertCid: certCid, casteCertCid },
+        },
+        pinataMetadata: { name: `application-${account}-${epoch}` },
+      });
+      setApplicationSnapshotCid(snapshotCid);
+    } catch (e) {
+      console.warn("snapshot pin failed", e);
+    }
     const body = {
       citizenAddress: account,
       programKey,
       policyId,
-      encryptedDocCid: studentDocCid || encryptedDocCid || "",
+      schemeKey: selectedSchemeKey || programKey,
+      schemeName: selectedMahadbtScheme?.name || selectedProgram.name,
+      department: selectedMahadbtScheme?.department || "",
+      encryptedDocCid: certCid,
+      incomeCertCid: certCid,
+      incomeCertName: incomeCertName || incomeCertFile?.name || "",
+      casteCertCid: casteCertCid || "",
+      casteCertName: casteCertName || "",
+      applicationYear: epoch || defaultAcademicYear(),
+      applicantProfile: { ...studentProfile, wallet: account },
+      applicationSnapshotCid: snapshotCid || "",
     };
     await fetchJson(`${PINATA_PROXY_URL}/applications`, {
       method: "POST",
@@ -836,7 +1143,7 @@ export default function App() {
     });
     setToast({ tone: "success", title: "Application submitted", message: "Status: Pending institute verification." });
     await fetchMyApplications();
-    setCitizenStep(2);
+    setCitizenStep(5);
   }
 
   async function markIssued(appId, txHash) {
@@ -1026,6 +1333,18 @@ export default function App() {
           </div>
         ) : null}
 
+        {backendPersistence === "none" ? (
+          <div className="mt-5 overflow-hidden rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+            <div className="font-semibold">Backend cannot save applications yet</div>
+            <p className="mt-2">
+              The API at <span className="font-mono">{PINATA_PROXY_URL}</span> is deployed without KV storage. In the{" "}
+              <strong>zkp-neon</strong> Vercel project, connect <strong>Storage → KV (Upstash)</strong>, then redeploy.
+              After redeploy, open <span className="font-mono">{PINATA_PROXY_URL}/health</span> — it should show{" "}
+              <span className="font-mono">"persistence":"kv"</span>.
+            </p>
+          </div>
+        ) : null}
+
         {error ? (
           <div className="mt-5 overflow-hidden rounded-2xl border border-red-200 bg-red-50 p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1164,6 +1483,8 @@ export default function App() {
                                   const p = SCHOLARSHIP_PROGRAMS.find((x) => x.key === (a.programKey || programKey)) || SCHOLARSHIP_PROGRAMS[0];
                                   setThreshold(String(p.incomeLimitINR));
                                   setEncryptedDocCid(a.encryptedDocCid || "");
+                                  const cert = a.incomeCertCid || a.encryptedDocCid || "";
+                                  loadIssuerCertificatePreview(cert).catch(() => {});
                                   try {
                                     const sid = deriveSubjectIdFromAddress(a.citizenAddress);
                                     generateCredentialHashFromInputs();
@@ -1176,26 +1497,37 @@ export default function App() {
                               />
                               <div className="min-w-0 flex-1">
                                 <div className="flex flex-wrap items-center justify-between gap-2">
-                                  <div className="font-semibold text-slate-900">{a.programKey}</div>
+                                  <div className="font-semibold text-slate-900">{a.schemeName || a.programKey}</div>
                                   <div className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-900 border border-amber-200">
                                     {a.status || "submitted"}
                                   </div>
                                 </div>
                                 <div className="mt-1 text-xs text-slate-600">
-                                  Student:{" "}
+                                  {a.applicantProfile?.applicantName || "—"} · {a.applicantProfile?.mobile || "—"} · {a.applicantProfile?.collegeName || "—"}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-600">
+                                  Wallet:{" "}
                                   <a className="font-mono text-blue-700 hover:text-blue-800" href={addrLink(a.citizenAddress)} target="_blank" rel="noreferrer">
                                     {short(a.citizenAddress)}
                                   </a>
                                 </div>
                                 <div className="mt-1 text-xs text-slate-600">
                                   Policy ID: <span className="font-mono text-slate-900">{a.policyId}</span>
-                                  {a.encryptedDocCid ? (
+                                  {(a.incomeCertCid || a.encryptedDocCid) ? (
                                     <>
                                       {" "}
-                                      · CID: <span className="font-mono text-slate-900">{short(a.encryptedDocCid)}</span>
+                                      · Cert:{" "}
+                                      <a
+                                        className="font-mono text-blue-700 hover:text-blue-800"
+                                        href={ipfsGatewayUrl(a.incomeCertCid || a.encryptedDocCid)}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                      >
+                                        {short(a.incomeCertCid || a.encryptedDocCid)}
+                                      </a>
                                     </>
                                   ) : (
-                                    <span> · No encrypted CID attached</span>
+                                    <span className="text-red-700"> · No income certificate</span>
                                   )}
                                 </div>
                               </div>
@@ -1205,15 +1537,7 @@ export default function App() {
                       </div>
                     )}
 
-                    {selectedApplication ? (
-                      <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-700">
-                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-600">Selected</div>
-                        <div className="mt-2">
-                          <span className="font-semibold text-slate-900">{selectedApplication.programKey}</span> for{" "}
-                          <span className="font-mono text-slate-900">{short(selectedApplication.citizenAddress)}</span>
-                        </div>
-                      </div>
-                    ) : null}
+                    {selectedApplication ? <ApplicationDetailPanel application={selectedApplication} ipfsGatewayUrl={ipfsGatewayUrl} /> : null}
 
                     <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
                       <Button
@@ -1238,50 +1562,45 @@ export default function App() {
 
                 {issuerStep === 1 ? (
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 2 — Upload (optional)</div>
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 2 — Review documents</div>
                     <div className="mt-2 text-sm text-slate-700">
-                      Upload an encrypted PDF/image only if you need audit evidence. ZK eligibility works without documents.
+                      Verify <strong>income</strong> and <strong>caste</strong> certificates on IPFS before issuing the on-chain credential.
                     </div>
-                    <div className="mt-3">
-                      <div className="flex items-center gap-2">
-                        <input
-                          id="attachDocIssuer"
-                          type="checkbox"
-                          checked={attachEncryptedDoc}
-                          onChange={(e) => setAttachEncryptedDoc(e.target.checked)}
-                          className="h-4 w-4 accent-indigo-400"
-                        />
-                        <label htmlFor="attachDocIssuer" className="text-sm text-slate-700">
-                          Attach encrypted document
-                        </label>
+                    {selectedApplication ? <ApplicationDetailPanel application={selectedApplication} ipfsGatewayUrl={ipfsGatewayUrl} /> : null}
+                    {!selectedAppDocsReady ? (
+                      <div className="mt-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-900">
+                        Missing documents: {!selectedAppCertCid ? "income certificate " : ""}
+                        {!selectedAppCasteCid ? "caste certificate " : ""}— ask the student to re-submit both.
                       </div>
-                      {attachEncryptedDoc ? (
-                        <div className="mt-3 grid gap-2">
-                          <input
-                            type="file"
-                            onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
-                            className="block w-full text-sm text-slate-700 file:mr-4 file:rounded-lg file:border-0 file:bg-slate-200 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-slate-900 hover:file:bg-slate-300"
-                          />
-                          <Field label="Passphrase (never uploaded)">
-                            <Input type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder="min 8 chars" />
-                          </Field>
-                          <div className="flex flex-wrap items-center gap-2">
-                            <Button variant="secondary" onClick={() => uploadEncryptedDoc().catch((e) => setError(String(e?.message || e)))}>
-                              Encrypt & Upload
-                            </Button>
-                            <div className="text-xs text-slate-600">
-                              CID: <code className="rounded bg-white/10 px-1 py-0.5">{encryptedDocCid || "-"}</code>
-                            </div>
-                          </div>
+                    ) : (
+                      <div className="mt-3 grid gap-4 md:grid-cols-2">
+                        <div className="rounded-xl border border-slate-200 bg-white p-3">
+                          <div className="text-xs font-semibold uppercase text-slate-600">Income certificate</div>
+                          <a className="mt-2 inline-block text-sm font-semibold text-blue-700" href={ipfsGatewayUrl(selectedAppCertCid)} target="_blank" rel="noreferrer">
+                            Open on IPFS →
+                          </a>
+                          <iframe title="Income" src={ipfsGatewayUrl(selectedAppCertCid)} className="mt-2 h-64 w-full rounded-lg border border-slate-200" />
                         </div>
-                      ) : null}
-                    </div>
+                        <div className="rounded-xl border border-slate-200 bg-white p-3">
+                          <div className="text-xs font-semibold uppercase text-slate-600">Caste certificate</div>
+                          <a className="mt-2 inline-block text-sm font-semibold text-blue-700" href={ipfsGatewayUrl(selectedAppCasteCid)} target="_blank" rel="noreferrer">
+                            Open on IPFS →
+                          </a>
+                          <iframe title="Caste" src={ipfsGatewayUrl(selectedAppCasteCid)} className="mt-2 h-64 w-full rounded-lg border border-slate-200" />
+                        </div>
+                      </div>
+                    )}
                     <div className="mt-4 flex items-center justify-between">
                       <Button variant="secondary" type="button" onClick={() => setIssuerStep(0)}>
                         ← Back
                       </Button>
-                      <Button type="button" onClick={() => setIssuerStep(2)} disabled={!account || (!isCurrentIssuer && !isAdmin)}>
-                        Next →
+                      <Button
+                        type="button"
+                        onClick={() => setIssuerStep(2)}
+                        disabled={!account || (!isCurrentIssuer && !isAdmin) || !selectedAppDocsReady}
+                        title={!selectedAppDocsReady ? "Both certificates required" : undefined}
+                      >
+                        Documents OK → Issue
                       </Button>
                     </div>
                   </div>
@@ -1370,8 +1689,14 @@ export default function App() {
                           })
                           .catch((e) => setError(String(e?.message || e)))
                       }
-                      disabled={!account || (!isCurrentIssuer && !isAdmin) || !selectedAppId}
-                      title={!isCurrentIssuer && !isAdmin ? "You must be an allowed issuer (or admin) to issue" : undefined}
+                      disabled={!account || (!isCurrentIssuer && !isAdmin) || !selectedAppId || !selectedAppDocsReady}
+                      title={
+                        !selectedAppDocsReady
+                          ? "Student must upload income and caste certificates"
+                          : !isCurrentIssuer && !isAdmin
+                            ? "You must be an allowed issuer (or admin) to issue"
+                            : undefined
+                      }
                     >
                       Issue credential
                     </Button>
@@ -1491,231 +1816,351 @@ export default function App() {
           <div className="mt-8 grid gap-5 lg:grid-cols-2">
             <Card
               title="MahaDBT-style Scholarship Portal"
-              subtitle="Guided flow: choose scheme → submit application → derive Citizen ID → ZK verify claim → status."
+              subtitle="MahaDBT-style flow: Connect wallet → Academic year → Profile → Eligible schemes → Print & submit → Institute verify → ZK claim."
             >
-              <div className="grid gap-3">
-                <Stepper steps={citizenSteps} current={citizenStep} />
+              <div className="grid gap-3 print:hidden">
+                <Stepper steps={citizenSteps} current={citizenStepperIndex} />
 
                 {citizenStep === 0 ? (
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 1 — Choose scheme</div>
-                    <div className="mt-2 grid gap-2">
-                      <div className="grid gap-1">
-                        <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Program</div>
-                        <select
-                          value={programKey}
-                          onChange={(e) => {
-                            const nextKey = e.target.value;
-                            setProgramKey(nextKey);
-                            const p = SCHOLARSHIP_PROGRAMS.find((x) => x.key === nextKey) || SCHOLARSHIP_PROGRAMS[0];
-                            setPolicyId(String(p.policyId));
-                            setThreshold(String(p.incomeLimitINR));
-                          }}
-                        className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-                        >
-                          {SCHOLARSHIP_PROGRAMS.map((p) => (
-                            <option key={p.key} value={p.key}>
-                              {p.name}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-700">
-                        <div className="font-semibold text-slate-900">{selectedProgram.name}</div>
-                        <div className="mt-1 text-slate-600">{selectedProgram.description}</div>
-                        <div className="mt-3 grid gap-1 text-xs text-slate-600">
-                          <div>
-                            Income limit (proof threshold):{" "}
-                            <span className="font-semibold text-slate-900">≤ ₹{selectedProgram.incomeLimitINR.toLocaleString("en-IN")}/year</span>
-                          </div>
-                          <ul className="mt-1 list-disc pl-5">
-                            {selectedProgram.notes.map((n) => (
-                              <li key={n}>{n}</li>
-                            ))}
-                          </ul>
-                          <div className="mt-2">Typical: Maharashtra domicile, CAP admission, income certificate by Tahsildar, no large academic gap.</div>
-                        </div>
-                      </div>
-                      <div className="mt-2 flex items-center justify-end">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Button
-                            variant="secondary"
-                            type="button"
-                            disabled={!account}
-                            title={!account ? "Connect wallet first" : undefined}
-                            onClick={() =>
-                              checkIfCredentialExistsForConnectedWallet()
-                                .then(({ has }) => {
-                                  setToast({
-                                    tone: "success",
-                                    title: has ? "Credential found" : "No credential yet",
-                                    message: has
-                                      ? "You can skip document submission and proceed to Citizen ID."
-                                      : "First-time enrollment: submit an application (documents) for institute verification.",
-                                  });
-                                  setCitizenStep(has ? 2 : 1);
-                                })
-                                .catch((e) => setError(String(e?.message || e)))
-                            }
-                          >
-                            Check credential (renewal?)
-                          </Button>
-                          <Button type="button" onClick={() => setCitizenStep(1)}>
-                            Next →
-                          </Button>
-                        </div>
-                      </div>
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 1 — Connect wallet</div>
+                    <div className="mt-2 text-sm text-slate-700">
+                      Connect your MetaMask wallet on <strong>MST Testnet</strong> first. This wallet becomes your Citizen ID for ZK‑Samvidhan.
+                    </div>
+                    <div className="mt-4 flex flex-wrap items-center gap-3">
+                      <Button onClick={connect}>{account ? `Connected: ${short(account)}` : "Connect Wallet"}</Button>
+                      {account ? (
+                        <span className="text-xs font-semibold text-emerald-700">Wallet ready</span>
+                      ) : (
+                        <span className="text-xs text-amber-800">Required before continuing</span>
+                      )}
+                    </div>
+                    <div className="mt-4 flex justify-end">
+                      <Button
+                        type="button"
+                        disabled={!account}
+                        onClick={() => {
+                          checkIfCredentialExistsForConnectedWallet().catch(() => {});
+                          setCitizenStep(1);
+                        }}
+                      >
+                        Next → Academic year
+                      </Button>
                     </div>
                   </div>
                 ) : null}
 
                 {citizenStep === 1 ? (
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">
-                      Step 2 — {hasIssuedCredential ? "Renewal (no documents required)" : "Submit application"}
-                    </div>
-                    <div className="mt-2 rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-700">
-                      {hasIssuedCredential ? (
-                        <>
-                          A credential is already issued for this wallet. You can proceed directly to your Citizen ID and submit a ZK claim for the selected year (epoch).
-                        </>
-                      ) : (
-                        <>
-                          Submit your application for institute verification. You may optionally attach an encrypted supporting document (AES‑GCM) uploaded via this portal’s IPFS proxy.
-                        </>
-                      )}
-                    </div>
-                    <div className="mt-3 rounded-xl border border-blue-200 bg-blue-50/80 p-3 text-sm text-slate-800">
-                      <div className="font-semibold text-slate-900">Credential status</div>
-                      <div className="mt-1">
-                        {hasIssuedCredential ? (
-                          <>Issued for this wallet. Renewal is enabled.</>
-                        ) : (
-                          <>Not issued yet. Renewal is disabled until the institute issues your credential.</>
-                        )}
-                      </div>
-                      <div className="mt-2 flex flex-wrap items-center gap-2">
-                        <Button
-                          variant="secondary"
-                          disabled={!account}
-                          onClick={() => checkIfCredentialExistsForConnectedWallet().catch((e) => setError(String(e?.message || e)))}
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 2 — Academic year (AY)</div>
+                    <div className="mt-2 text-sm text-slate-700">Select the academic year for this application / renewal claim (e.g. AY 2025-2026 → <strong>2026</strong>, AY 2026-2027 → <strong>2027</strong>).</div>
+                    <div className="mt-3 max-w-xs">
+                      <Field label="Academic year">
+                        <select
+                          value={epoch}
+                          onChange={(e) => setEpoch(e.target.value)}
+                          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
                         >
-                          Refresh status
-                        </Button>
-                        {hasIssuedCredential ? (
-                          <Button variant="secondary" onClick={() => setCitizenStep(2)}>
-                            Continue →
-                          </Button>
-                        ) : null}
-                      </div>
+                          {ACADEMIC_YEARS.map((y) => (
+                            <option key={y} value={String(y)}>
+                              AY {y - 1}-{y} (epoch {y})
+                            </option>
+                          ))}
+                        </select>
+                      </Field>
                     </div>
-
-                    {!hasIssuedCredential ? (
-                      <div className="mt-4 grid gap-3 rounded-xl border border-slate-200 bg-white p-3">
-                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-600">Optional encrypted attachment</div>
-                        <input
-                          type="file"
-                          onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
-                          className="block w-full text-sm text-slate-700 file:mr-4 file:rounded-lg file:border-0 file:bg-slate-200 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-slate-900 hover:file:bg-slate-300"
-                        />
-                        <Field label="Passphrase (never uploaded)">
-                          <Input type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder="min 8 chars" />
-                        </Field>
-                        <div className="text-xs text-slate-600">
-                          File: <span className="font-semibold text-slate-900">{selectedFile?.name || "None selected"}</span>
-                          {passphrase && passphrase.length < 8 ? (
-                            <span className="ml-2 text-red-700">Passphrase must be at least 8 characters.</span>
-                          ) : null}
-                        </div>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Button
-                            variant="secondary"
-                            disabled={!selectedFile || !passphrase || passphrase.length < 8}
-                            title={!selectedFile ? "Select a file first" : !passphrase || passphrase.length < 8 ? "Enter passphrase (min 8 chars)" : undefined}
-                            onClick={() => uploadEncryptedDoc().catch((e) => setError(String(e?.message || e)))}
-                          >
-                            Encrypt & Upload
-                          </Button>
-                          <div className="text-xs text-slate-600">
-                            CID:{" "}
-                            <code className="rounded bg-slate-100 px-1 py-0.5 text-slate-900">{studentDocCid || encryptedDocCid || "-"}</code>
-                          </div>
-                        </div>
+                    {hasIssuedCredential ? (
+                      <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-slate-800">
+                        Credential already issued. Skip documents — continue to annual ZK claim for year <strong>{epoch}</strong>.
                       </div>
                     ) : null}
-
-                    <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <div className="text-xs font-semibold uppercase tracking-wide text-slate-600">Your applications</div>
-                          {hasSubmittedPending ? (
-                            <span className="text-xs text-slate-500">Auto-refresh ~15s while pending</span>
-                          ) : null}
-                        </div>
-                        <Button variant="secondary" type="button" onClick={() => fetchMyApplications().catch(() => {})}>
-                          Refresh
-                        </Button>
-                      </div>
-                      {myApplications.length === 0 ? (
-                        <div className="mt-2 text-sm text-slate-600">No submissions yet for this wallet.</div>
-                      ) : (
-                        <div className="mt-3 grid gap-2">
-                          {myApplications.map((a) => (
-                            <div key={a.id} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <div className="font-semibold text-slate-900">{a.programKey}</div>
-                                <div
-                                  className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
-                                    a.status === "issued"
-                                      ? "bg-emerald-50 text-emerald-800 border border-emerald-200"
-                                      : a.status === "rejected"
-                                        ? "bg-red-50 text-red-800 border border-red-200"
-                                        : "bg-amber-50 text-amber-900 border border-amber-200"
-                                  }`}
-                                >
-                                  {a.status || "submitted"}
-                                </div>
-                              </div>
-                              <div className="mt-1 text-xs text-slate-600">
-                                Policy ID: <span className="font-mono text-slate-900">{a.policyId}</span>
-                                {a.encryptedDocCid ? (
-                                  <>
-                                    {" "}
-                                    · CID: <span className="font-mono text-slate-900">{short(a.encryptedDocCid)}</span>
-                                  </>
-                                ) : null}
-                              </div>
-                              {a.status === "issued" && a.issuedTxHash ? (
-                                <a className="mt-2 inline-flex text-xs font-semibold text-blue-700 hover:text-blue-800" href={txLink(a.issuedTxHash)} target="_blank" rel="noreferrer">
-                                  View issuance tx →
-                                </a>
-                              ) : a.status === "rejected" ? (
-                                <div className="mt-2 text-xs text-red-800">This application was not approved by the institute.</div>
-                              ) : null}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="mt-4 flex items-center justify-between">
+                    <div className="mt-4 flex justify-between">
                       <Button variant="secondary" type="button" onClick={() => setCitizenStep(0)}>
                         ← Back
                       </Button>
                       <Button
                         type="button"
-                        disabled={!account || hasIssuedCredential}
-                        onClick={() => submitScholarshipApplication().catch((e) => setError(String(e?.message || e)))}
+                        onClick={() => setCitizenStep(hasIssuedCredential ? 5 : 2)}
                       >
-                        Submit application
+                        Next →
                       </Button>
                     </div>
                   </div>
                 ) : null}
 
-                {citizenStep === 2 ? (
+                {citizenStep === 2 && !hasIssuedCredential ? (
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 3 — Your Citizen ID</div>
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 3 — Profile (MahaDBT-style)</div>
+                    <div className="mt-2 text-sm text-slate-700">
+                      Fill personal, education and bank details as on MahaDBT. All * fields are required before Apply.
+                    </div>
+                    <div className="mt-3 text-xs font-bold uppercase text-slate-500">Personal *</div>
+                    <div className="mt-2 grid gap-3 md:grid-cols-2">
+                      <Field label="Applicant name (SSC) *">
+                        <Input value={studentProfile.applicantName} onChange={(e) => setStudentProfile((p) => ({ ...p, applicantName: e.target.value }))} />
+                      </Field>
+                      <Field label="Date of birth">
+                        <Input value={studentProfile.dateOfBirth} onChange={(e) => setStudentProfile((p) => ({ ...p, dateOfBirth: e.target.value }))} />
+                      </Field>
+                      <Field label="Gender">
+                        <select value={studentProfile.gender} onChange={(e) => setStudentProfile((p) => ({ ...p, gender: e.target.value }))} className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm">
+                          <option>Male</option>
+                          <option>Female</option>
+                          <option>Other</option>
+                        </select>
+                      </Field>
+                      <Field label="Mobile *">
+                        <Input value={studentProfile.mobile} onChange={(e) => setStudentProfile((p) => ({ ...p, mobile: e.target.value }))} />
+                      </Field>
+                      <Field label="Email *">
+                        <Input value={studentProfile.email} onChange={(e) => setStudentProfile((p) => ({ ...p, email: e.target.value }))} />
+                      </Field>
+                      <Field label="Parent / guardian mobile">
+                        <Input value={studentProfile.parentMobile} onChange={(e) => setStudentProfile((p) => ({ ...p, parentMobile: e.target.value }))} />
+                      </Field>
+                      <Field label="Aadhaar (last 4 digits)">
+                        <Input value={studentProfile.aadhaarLast4} onChange={(e) => setStudentProfile((p) => ({ ...p, aadhaarLast4: e.target.value }))} maxLength={4} />
+                      </Field>
+                    </div>
+                    <div className="mt-4 text-xs font-bold uppercase text-slate-500">Caste & income *</div>
+                    <div className="mt-2 grid gap-3 md:grid-cols-2">
+                      <Field label="Caste category *">
+                        <select value={studentProfile.casteCategory} onChange={(e) => setStudentProfile((p) => ({ ...p, casteCategory: e.target.value }))} className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm">
+                          {CASTE_CATEGORIES.map((c) => (
+                            <option key={c} value={c}>{c}</option>
+                          ))}
+                        </select>
+                      </Field>
+                      <Field label="Caste name">
+                        <Input value={studentProfile.casteName} onChange={(e) => setStudentProfile((p) => ({ ...p, casteName: e.target.value }))} />
+                      </Field>
+                      <Field label="Religion *">
+                        <select value={studentProfile.religion} onChange={(e) => setStudentProfile((p) => ({ ...p, religion: e.target.value }))} className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm">
+                          {RELIGIONS.map((r) => (
+                            <option key={r} value={r}>{r}</option>
+                          ))}
+                        </select>
+                      </Field>
+                      <Field label="Family annual income (₹) *">
+                        <Input value={studentProfile.familyAnnualIncome} onChange={(e) => setStudentProfile((p) => ({ ...p, familyAnnualIncome: e.target.value }))} />
+                      </Field>
+                      <Field label="Income certificate no.">
+                        <Input value={studentProfile.incomeCertNo} onChange={(e) => setStudentProfile((p) => ({ ...p, incomeCertNo: e.target.value }))} />
+                      </Field>
+                      <Field label="Income cert. issue date">
+                        <Input value={studentProfile.incomeCertIssueDate} onChange={(e) => setStudentProfile((p) => ({ ...p, incomeCertIssueDate: e.target.value }))} placeholder="DD/MM/YYYY" />
+                      </Field>
+                      <Field label="Caste certificate no.">
+                        <Input value={studentProfile.casteCertNo} onChange={(e) => setStudentProfile((p) => ({ ...p, casteCertNo: e.target.value }))} />
+                      </Field>
+                      <Field label="Issuing district">
+                        <Input value={studentProfile.issuingDistrict} onChange={(e) => setStudentProfile((p) => ({ ...p, issuingDistrict: e.target.value }))} />
+                      </Field>
+                    </div>
+                    <div className="mt-4 text-xs font-bold uppercase text-slate-500">College / course *</div>
+                    <div className="mt-2 grid gap-3 md:grid-cols-2">
+                      <Field label="College / institute *">
+                        <Input value={studentProfile.collegeName} onChange={(e) => setStudentProfile((p) => ({ ...p, collegeName: e.target.value }))} />
+                      </Field>
+                      <Field label="Institute code">
+                        <Input value={studentProfile.instituteCode} onChange={(e) => setStudentProfile((p) => ({ ...p, instituteCode: e.target.value }))} />
+                      </Field>
+                      <Field label="Department *">
+                        <Input value={studentProfile.department} onChange={(e) => setStudentProfile((p) => ({ ...p, department: e.target.value }))} />
+                      </Field>
+                      <Field label="Course *">
+                        <Input value={studentProfile.course} onChange={(e) => setStudentProfile((p) => ({ ...p, course: e.target.value }))} />
+                      </Field>
+                      <Field label="Course year *">
+                        <Input value={studentProfile.courseYear} onChange={(e) => setStudentProfile((p) => ({ ...p, courseYear: e.target.value }))} />
+                      </Field>
+                      <Field label="PRN / roll no. *">
+                        <Input value={studentProfile.prn} onChange={(e) => setStudentProfile((p) => ({ ...p, prn: e.target.value }))} />
+                      </Field>
+                    </div>
+                    <div className="mt-4 text-xs font-bold uppercase text-slate-500">Bank</div>
+                    <div className="mt-2 grid gap-3 md:grid-cols-2">
+                      <Field label="Bank account no.">
+                        <Input value={studentProfile.bankAccount} onChange={(e) => setStudentProfile((p) => ({ ...p, bankAccount: e.target.value }))} />
+                      </Field>
+                      <Field label="IFSC">
+                        <Input value={studentProfile.ifsc} onChange={(e) => setStudentProfile((p) => ({ ...p, ifsc: e.target.value }))} />
+                      </Field>
+                      <Field label="Branch">
+                        <Input value={studentProfile.branchName} onChange={(e) => setStudentProfile((p) => ({ ...p, branchName: e.target.value }))} />
+                      </Field>
+                    </div>
+                    <label className="mt-3 flex items-center gap-2 text-sm text-slate-700">
+                      <input type="checkbox" checked={studentProfile.domicileMH !== false} onChange={(e) => setStudentProfile((p) => ({ ...p, domicileMH: e.target.checked }))} className="h-4 w-4" />
+                      Domicile of Maharashtra *
+                    </label>
+                    <div className="mt-4 flex justify-between">
+                      <Button variant="secondary" onClick={() => setCitizenStep(1)}>
+                        ← Back
+                      </Button>
+                      <Button onClick={() => setCitizenStep(3)}>Next → Eligible schemes</Button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {citizenStep === 3 && !hasIssuedCredential ? (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 4 — Suggested eligible schemes</div>
+                    <div className="mt-2 text-sm text-slate-700">
+                      Based on caste <strong>{studentProfile.casteCategory}</strong>, religion <strong>{studentProfile.religion}</strong>, income{" "}
+                      <strong>₹{Number(studentProfile.familyAnnualIncome || 0).toLocaleString("en-IN")}</strong>.
+                    </div>
+                    <div className="mt-3 overflow-x-auto rounded-xl border border-slate-200 bg-white">
+                      <table className="min-w-full text-left text-sm">
+                        <thead className="border-b border-slate-200 bg-slate-50 text-xs font-semibold uppercase text-slate-600">
+                          <tr>
+                            <th className="px-3 py-2">Scheme name</th>
+                            <th className="px-3 py-2">Department</th>
+                            <th className="px-3 py-2">Type</th>
+                            <th className="px-3 py-2">Income limit</th>
+                            <th className="px-3 py-2">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {eligibleSchemes.length === 0 ? (
+                            <tr>
+                              <td colSpan={5} className="px-3 py-4 text-slate-600">
+                                No schemes match your profile. Adjust income or caste details.
+                              </td>
+                            </tr>
+                          ) : (
+                            eligibleSchemes.map((s) => (
+                              <tr key={s.key} className="border-b border-slate-100">
+                                <td className="px-3 py-2 font-medium text-slate-900">{s.name}</td>
+                                <td className="px-3 py-2 text-slate-600">{s.department}</td>
+                                <td className="px-3 py-2 text-slate-600">{s.schemeType}</td>
+                                <td className="px-3 py-2">≤ ₹{s.incomeLimitINR.toLocaleString("en-IN")}</td>
+                                <td className="px-3 py-2">
+                                  <Button type="button" onClick={() => applyToScheme(s)}>
+                                    Apply
+                                  </Button>
+                                </td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="mt-4 flex justify-between">
+                      <Button variant="secondary" onClick={() => setCitizenStep(2)}>
+                        ← Back
+                      </Button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {citizenStep === 4 && !hasIssuedCredential ? (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 5 — Apply online (documents + print)</div>
+                    {selectedMahadbtScheme ? (
+                      <div className="mt-2 rounded-xl border border-blue-200 bg-blue-50/80 p-3 text-sm">
+                        <div className="font-semibold text-slate-900">{selectedMahadbtScheme.name}</div>
+                        <div className="text-slate-600">{selectedMahadbtScheme.department} · AY epoch {epoch}</div>
+                      </div>
+                    ) : null}
+                    {backendPinataOk === false ? (
+                      <div className="mt-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-900">
+                        Backend cannot upload: <span className="font-mono">{PINATA_PROXY_URL}</span> has no PINATA_JWT. Set it in server <code>.env</code> or Vercel (zkp-neon) and restart.
+                      </div>
+                    ) : null}
+                    <div className="mt-3 grid gap-3">
+                      <DocumentUploadField
+                        label="Income certificate (Tahsildar)"
+                        required
+                        file={incomeCertFile}
+                        onFileSelect={(f) => {
+                          setIncomeCertFile(f);
+                          setIncomeCertCid("");
+                          if (f) setToast({ tone: "success", title: "Income file selected", message: f.name });
+                        }}
+                        cid={incomeCertCid}
+                        uploading={uploadingIncome}
+                        onUpload={() => uploadIncomeCertificate().catch((e) => setError(String(e?.message || e)))}
+                        tone="amber"
+                      />
+                      {incomeCertCid ? (
+                        <a className="text-xs font-semibold text-blue-700" href={ipfsGatewayUrl(incomeCertCid)} target="_blank" rel="noreferrer">
+                          Preview income certificate on IPFS →
+                        </a>
+                      ) : null}
+                      <DocumentUploadField
+                        label="Caste certificate"
+                        required
+                        file={casteCertFile}
+                        onFileSelect={(f) => {
+                          setCasteCertFile(f);
+                          setCasteCertCid("");
+                          if (f) setToast({ tone: "success", title: "Caste file selected", message: f.name });
+                        }}
+                        cid={casteCertCid}
+                        uploading={uploadingCaste}
+                        onUpload={() => uploadCasteCertificate().catch((e) => setError(String(e?.message || e)))}
+                        tone="slate"
+                      />
+                      {casteCertCid ? (
+                        <a className="text-xs font-semibold text-blue-700" href={ipfsGatewayUrl(casteCertCid)} target="_blank" rel="noreferrer">
+                          Preview caste certificate on IPFS →
+                        </a>
+                      ) : null}
+                    </div>
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      <Button
+                        variant="secondary"
+                        onClick={() => {
+                          const miss = validateProfileForApply(studentProfile);
+                          if (miss.length) {
+                            setError(`Complete profile (Step 3): ${miss.join(", ")}`);
+                            setCitizenStep(2);
+                            return;
+                          }
+                          setShowPrintPreview(true);
+                          printApplicationPreview();
+                        }}
+                      >
+                        Preview / Print application
+                      </Button>
+                      <Button
+                        disabled={!incomeCertCid || !casteCertCid || hasSubmittedPending}
+                        title={
+                          !incomeCertCid
+                            ? "Upload income certificate (Choose file → Upload)"
+                            : !casteCertCid
+                              ? "Upload caste certificate (Choose file → Upload)"
+                              : undefined
+                        }
+                        onClick={() => submitScholarshipApplication().catch((e) => setError(String(e?.message || e)))}
+                      >
+                        Submit to institute
+                      </Button>
+                    </div>
+                    <div className="mt-4 flex justify-between">
+                      <Button variant="secondary" onClick={() => setCitizenStep(3)}>
+                        ← Back
+                      </Button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {showPrintPreview && !hasIssuedCredential ? (
+                  <ApplicationPrint
+                    profile={studentProfile}
+                    account={account}
+                    epoch={epoch}
+                    scheme={selectedMahadbtScheme}
+                    incomeCertCid={incomeCertCid}
+                    casteCertCid={casteCertCid}
+                    applicationSnapshotCid={applicationSnapshotCid}
+                  />
+                ) : null}
+
+                {citizenStep === 5 ? (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 6 — Your Citizen ID</div>
                     <div className="mt-2 rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-700">
                       Your Citizen ID is derived from your wallet. Issuer uses the same method to issue your scholarship credential.
                     </div>
@@ -1748,32 +2193,59 @@ export default function App() {
                       {isBytes32Hex(subjectId) ? subjectId : "Not set yet"}
                     </div>
                     <div className="mt-4 flex items-center justify-between">
-                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(1)}>
+                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(hasIssuedCredential ? 1 : 4)}>
                         ← Back
                       </Button>
-                      <Button type="button" onClick={() => setCitizenStep(3)} disabled={!isBytes32Hex(subjectId)}>
-                        Next →
+                      <Button
+                        type="button"
+                        onClick={() => {
+                          refreshClaimedEpochs().catch(() => {});
+                          setCitizenStep(6);
+                        }}
+                        disabled={!isBytes32Hex(subjectId)}
+                      >
+                        Next → ZK claim
                       </Button>
                     </div>
                   </div>
                 ) : null}
 
-                {citizenStep === 3 ? (
+                {citizenStep === 6 ? (
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 4 — ZK proof</div>
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">
+                      Step 7 — {hasIssuedCredential ? "Annual ZK claim" : "ZK claim"}
+                    </div>
                     <div className="mt-2 grid gap-3 md:grid-cols-2">
-                      <Field label="renewal epoch (public)">
-                        <Input value={epoch} onChange={(e) => setEpoch(e.target.value)} placeholder="e.g. 2026" />
+                      <Field label="Academic year (selected earlier)">
+                        <Input value={`AY ${Number(epoch) - 1}-${epoch} (epoch ${epoch})`} disabled />
                       </Field>
-                      <Field label="income (private)">
-                        <Input value={income} onChange={(e) => setIncome(e.target.value)} />
-                      </Field>
-                      <Field label="threshold (from scheme)">
+                      <Field label="Scheme threshold (public, from policy)">
                         <Input value={threshold} disabled />
                       </Field>
                     </div>
-                    <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-600">
-                      Your income stays private. Only eligibility (income ≤ threshold) is proven.
+                    <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-slate-800">
+                      {hasIssuedCredential ? (
+                        <>
+                          Renewal: your income was verified at issuance. You do <strong>not</strong> re-upload a certificate or re-enter income. The proof only shows you still meet the scheme limit (≤ ₹
+                          {Number(threshold).toLocaleString("en-IN")}/year).
+                        </>
+                      ) : (
+                        <>
+                          After the institute issues your credential, your claim uses the verified eligibility bound — income amount is not shown in the portal.
+                        </>
+                      )}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-600">
+                      {ACADEMIC_YEARS.map((y) => (
+                        <span
+                          key={y}
+                          className={`rounded-full px-2 py-0.5 border ${
+                            claimedEpochs[y] ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-slate-50 border-slate-200"
+                          }`}
+                        >
+                          {y}: {claimedEpochs[y] ? "claimed" : "open"}
+                        </span>
+                      ))}
                     </div>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
                       <Button
@@ -1806,32 +2278,38 @@ export default function App() {
                         type="button"
                         onClick={() =>
                           generateProofAndClaim()
-                            .then(() => setCitizenStep(4))
+                            .then(() => setCitizenStep(7))
                             .catch((e) => setError(String(e?.message || e)))
                         }
-                        disabled={!hasIssuedCredential}
-                        title={!hasIssuedCredential ? "Renewal/claim is enabled only after your credential is issued." : undefined}
+                        disabled={!hasIssuedCredential || claimedEpochs[Number(epoch)]}
+                        title={
+                          !hasIssuedCredential
+                            ? "Claim is enabled only after the institute issues your credential."
+                            : claimedEpochs[Number(epoch)]
+                              ? `You already claimed for ${epoch}.`
+                              : undefined
+                        }
                       >
-                        Submit claim (ZK verify)
+                        Submit annual claim ({epoch})
                       </Button>
                     </div>
                     <div className="mt-2 text-xs text-slate-600">
                       Uses ZK files from <code className="rounded bg-white/10 px-1 py-0.5">/public/zk</code> and submits on-chain.
                     </div>
                     <div className="mt-4 flex items-center justify-between">
-                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(2)}>
+                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(5)}>
                         ← Back
                       </Button>
-                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(4)}>
+                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(7)}>
                         Skip to status →
                       </Button>
                     </div>
                   </div>
                 ) : null}
 
-                {citizenStep === 4 ? (
+                {citizenStep === 7 ? (
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 5 — Status</div>
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 8 — Status</div>
                     {lastSuccess ? (
                       <div className="mt-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
                         <div className="text-sm font-semibold text-slate-900">Claimed successfully</div>
@@ -1850,7 +2328,7 @@ export default function App() {
                       </div>
                     ) : (
                       <div className="mt-3 rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-700">
-                        No claim submitted yet. Go back to Step 4 to submit your ZK proof.
+                        No claim submitted yet. Go back to ZK claim step after institute issues your credential.
                       </div>
                     )}
                     <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3">
@@ -1890,11 +2368,11 @@ export default function App() {
                       )}
                     </div>
                     <div className="mt-4 flex items-center justify-between">
-                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(3)}>
+                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(6)}>
                         ← Back
                       </Button>
                       <Button variant="secondary" type="button" onClick={() => setCitizenStep(0)}>
-                        Start new application
+                        Start from wallet
                       </Button>
                     </div>
                   </div>
@@ -1907,8 +2385,7 @@ export default function App() {
               subtitle="After you submit, your institute reviews the application off-chain, then issues an on-chain eligibility credential your wallet can use for ZK verification."
             >
               <div className="text-sm text-slate-700">
-                You can track queue status in <span className="font-semibold text-slate-900">Step 5 — Status</span> and in{" "}
-                <span className="font-semibold text-slate-900">Step 2 — Submit application</span>. While your application is pending, the list refreshes about every 15 seconds.
+                After <span className="font-semibold text-slate-900">Print & Submit</span>, the institute reviews your IPFS documents and issues an on-chain credential. Then complete <span className="font-semibold text-slate-900">ZK claim</span> for the selected academic year.
               </div>
             </Card>
           </div>

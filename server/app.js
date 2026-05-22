@@ -7,13 +7,18 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
+function envTrim(key) {
+  return String(process.env[key] || "").trim();
+}
+
 function createApp() {
-  // Load env from root when running locally; on Vercel env is injected.
-  try {
-    // eslint-disable-next-line global-require
-    require("dotenv").config({ path: require("path").join(__dirname, "..", ".env") });
-  } catch {
-    // ignore
+  // index.js loads .env locally; Vercel injects env vars directly.
+  if (!envTrim("PINATA_JWT")) {
+    try {
+      require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+    } catch {
+      // ignore
+    }
   }
 
   const app = express();
@@ -27,13 +32,13 @@ function createApp() {
   const appsKey = "zk-samvidhan:applications:v1";
 
   const isVercel = Boolean(process.env.VERCEL);
-  const hasVercelKv =
-    Boolean(process.env.KV_REST_API_URL) &&
-    Boolean(process.env.KV_REST_API_TOKEN);
+  const kvRestUrl = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
+  const kvRestToken = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+  const hasVercelKv = Boolean(kvRestUrl) && Boolean(kvRestToken);
 
   async function kvGetJson(key, fallback) {
-    const base = process.env.KV_REST_API_URL;
-    const token = process.env.KV_REST_API_TOKEN;
+    const base = kvRestUrl;
+    const token = kvRestToken;
     const r = await fetch(`${base}/get/${encodeURIComponent(key)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -49,8 +54,8 @@ function createApp() {
   }
 
   async function kvSetJson(key, value) {
-    const base = process.env.KV_REST_API_URL;
-    const token = process.env.KV_REST_API_TOKEN;
+    const base = kvRestUrl;
+    const token = kvRestToken;
     const payload = JSON.stringify(value);
     const r = await fetch(`${base}/set/${encodeURIComponent(key)}`, {
       method: "POST",
@@ -70,11 +75,25 @@ function createApp() {
 
   async function readApps() {
     if (hasVercelKv) {
-      return await kvGetJson(appsKey, { applications: [] });
+      try {
+        return await kvGetJson(appsKey, { applications: [] });
+      } catch (e) {
+        console.error("KV read failed:", e);
+        return { applications: [] };
+      }
     }
-    ensureDataFile();
-    const raw = fs.readFileSync(appsFile, "utf8");
-    return JSON.parse(raw);
+    if (isVercel) {
+      // Do not serve bundled applications.json on Vercel — it is read-only and misleads GET while POST fails.
+      return { applications: [] };
+    }
+    try {
+      ensureDataFile();
+      const raw = fs.readFileSync(appsFile, "utf8");
+      return JSON.parse(raw);
+    } catch (e) {
+      console.error("File read failed:", e);
+      return { applications: [] };
+    }
   }
 
   async function writeApps(obj) {
@@ -82,22 +101,33 @@ function createApp() {
       await kvSetJson(appsKey, obj);
       return;
     }
-    // On Vercel, filesystem writes are not reliable; return a clear error.
     if (isVercel) {
-      throw new Error("Persistence not configured. Enable Vercel KV (KV_REST_API_URL + KV_REST_API_TOKEN).");
+      throw new Error(
+        "Persistence not configured on Vercel. Open the zkp-neon project → Storage → connect KV/Upstash → redeploy so KV_REST_API_URL and KV_REST_API_TOKEN are set."
+      );
     }
     ensureDataFile();
     fs.writeFileSync(appsFile, JSON.stringify(obj, null, 2));
   }
 
   function getPinataAuthHeader() {
-    const jwt = (process.env.PINATA_JWT || "").trim();
-    if (!jwt) throw new Error("Missing PINATA_JWT (set it in your server environment variables)");
+    const jwt = envTrim("PINATA_JWT");
+    if (!jwt) {
+      throw new Error(
+        "Missing PINATA_JWT. Add PINATA_JWT=your_jwt to the repo root .env (no space after =), restart: cd server && npm run dev"
+      );
+    }
     return { Authorization: `Bearer ${jwt}` };
   }
 
   app.get("/health", (_req, res) => {
-    res.json({ ok: true });
+    res.json({
+      ok: true,
+      persistence: hasVercelKv ? "kv" : isVercel ? "none" : "file",
+      vercel: isVercel,
+      pinata: Boolean(envTrim("PINATA_JWT")),
+      pinataJwtLength: envTrim("PINATA_JWT").length,
+    });
   });
 
   app.post("/pin/json", async (req, res) => {
@@ -109,7 +139,8 @@ function createApp() {
       });
       res.json(r.data);
     } catch (e) {
-      res.status(500).json({ error: e?.response?.data || String(e) });
+      const msg = e?.response?.data || e?.message || String(e);
+      res.status(500).json({ error: typeof msg === "object" ? JSON.stringify(msg) : msg });
     }
   });
 
@@ -128,7 +159,12 @@ function createApp() {
       });
       res.json(r.data);
     } catch (e) {
-      res.status(500).json({ error: e?.response?.data || String(e) });
+      const msg = e?.response?.data || e?.message || String(e);
+      console.error("pin/file error:", msg);
+      res.status(500).json({
+        error: typeof msg === "object" ? JSON.stringify(msg) : msg,
+        hint: "Check PINATA_JWT on the server (zkp-neon Vercel env or local .env).",
+      });
     }
   });
 
@@ -149,27 +185,61 @@ function createApp() {
 
   app.post("/applications", async (req, res) => {
     try {
-      const { citizenAddress, programKey, policyId, encryptedDocCid } = req.body || {};
+      const {
+        citizenAddress,
+        programKey,
+        policyId,
+        encryptedDocCid,
+        incomeCertCid,
+        incomeCertName,
+        casteCertCid,
+        casteCertName,
+        applicationYear,
+        applicantProfile,
+        schemeKey,
+        schemeName,
+        department,
+        applicationSnapshotCid,
+      } = req.body || {};
       if (!citizenAddress || !programKey || !policyId) {
         return res.status(400).json({ error: "Missing citizenAddress/programKey/policyId" });
+      }
+      const certCid = String(incomeCertCid || encryptedDocCid || "").trim();
+      const casteCid = String(casteCertCid || "").trim();
+      if (!certCid) {
+        return res.status(400).json({ error: "Income certificate is required (upload PDF/image first)." });
+      }
+      if (!casteCid) {
+        return res.status(400).json({ error: "Caste certificate is required (upload PDF/image first)." });
       }
       const store = await readApps();
       const appItem = {
         id: crypto.randomUUID(),
-        citizenAddress,
-        programKey,
+        citizenAddress: String(citizenAddress).trim(),
+        programKey: String(programKey).trim(),
         policyId: String(policyId),
-        encryptedDocCid: encryptedDocCid || "",
-        status: "submitted", // submitted | issued | rejected
+        encryptedDocCid: encryptedDocCid || certCid,
+        incomeCertCid: certCid,
+        incomeCertName: incomeCertName || "",
+        casteCertCid: casteCertCid || "",
+        casteCertName: casteCertName || "",
+        applicationYear: String(applicationYear || new Date().getFullYear()),
+        schemeKey: schemeKey || programKey,
+        schemeName: schemeName || "",
+        department: department || "",
+        applicantProfile: applicantProfile || null,
+        applicationSnapshotCid: applicationSnapshotCid || "",
+        status: "submitted",
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         issuedTxHash: "",
       };
       store.applications.unshift(appItem);
       await writeApps(store);
-      res.json(appItem);
+      return res.status(201).json(appItem);
     } catch (e) {
-      res.status(500).json({ error: String(e?.message || e) });
+      console.error("POST /applications error:", e);
+      return res.status(500).json({ error: String(e?.message || e) });
     }
   });
 
@@ -184,9 +254,10 @@ function createApp() {
       if (issuedTxHash !== undefined) store.applications[idx].issuedTxHash = issuedTxHash;
       store.applications[idx].updatedAt = new Date().toISOString();
       await writeApps(store);
-      res.json(store.applications[idx]);
+      return res.json(store.applications[idx]);
     } catch (e) {
-      res.status(500).json({ error: String(e?.message || e) });
+      console.error("PATCH /applications error:", e);
+      return res.status(500).json({ error: String(e?.message || e) });
     }
   });
 

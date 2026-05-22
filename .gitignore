@@ -17,3 +17,5 @@ circuits/**/*.zkey
 circuits/**/*.vkey.json
 
 deployments/
+
+server/data/applications.json
