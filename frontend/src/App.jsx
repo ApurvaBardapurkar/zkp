@@ -202,6 +202,15 @@ function decodeCustomErrorSelector(sel) {
       title: "Already claimed this year",
       message: "You already submitted a ZK claim for this academic year. Pick another year (e.g. 2027) or wait until the next period.",
     }, // AlreadyClaimedForEpoch() — verify on-chain if selector changes after redeploy
+    "0x69574da3": {
+      title: "Credential already issued on-chain",
+      message:
+        "This credential hash is already in the Merkle tree. Do not re-issue the same application. For annual renewal, select the renewal queue item (new income → new hash).",
+    }, // LeafAlreadyIssued()
+    "0x0432f01c": {
+      title: "Invalid Merkle root",
+      message: "Merkle root was zero or invalid. Refresh the page, re-select the application, and try again.",
+    }, // MerkleRootMismatch()
   };
   return map[s] || null;
 }
@@ -467,6 +476,7 @@ export default function App() {
   const [renewalIncomeFile, setRenewalIncomeFile] = useState(null);
   const [renewalIncomeCid, setRenewalIncomeCid] = useState("");
   const [uploadingRenewalIncome, setUploadingRenewalIncome] = useState(false);
+  const [selectedCredOnChain, setSelectedCredOnChain] = useState(false);
 
   const casteCertCid = oneTimeDocs.casteCert?.cid || "";
   const [applicationSnapshotCid, setApplicationSnapshotCid] = useState("");
@@ -987,6 +997,13 @@ export default function App() {
     }
   }
 
+  async function isCredentialHashOnChain(credentialHashHex) {
+    if (!isBytes32Hex(credentialHashHex)) return false;
+    const readProvider = new ethers.JsonRpcProvider(MST_RPC_URL);
+    const registry = registryContract(ethers, readProvider);
+    return registry.issuedLeaf(credentialHashHex);
+  }
+
   async function prepareCredentialFromApplication(app) {
     if (!app) throw new Error("Select an application first.");
     const ot = oneTimeDocsFromApplication(app);
@@ -1005,6 +1022,8 @@ export default function App() {
     setIncomeCommitmentHex(bundle.incomeCommitment);
     setEncryptedDocCid(app.incomeCertCid || app.encryptedDocCid || "");
     setPolicyId(String(app.policyId));
+    const onChain = await isCredentialHashOnChain(bundle.credentialHash);
+    setSelectedCredOnChain(onChain);
     return bundle;
   }
 
@@ -1023,6 +1042,15 @@ export default function App() {
       }
       if (!isBytes32Hex(subjectId) || !isBytes32Hex(credentialHash)) {
         throw new Error("Load Citizen ID + credential hash from the pending application first.");
+      }
+      if (await isCredentialHashOnChain(credentialHash)) {
+        setToast({
+          tone: "error",
+          title: "Already issued on-chain",
+          message:
+            "This credential hash is already registered. Select a new pending application (e.g. annual renewal with updated income), or mark the queue item issued if the tx succeeded earlier.",
+        });
+        throw new Error("LeafAlreadyIssued");
       }
       const leaves = await syncMerkleFromServer(PINATA_PROXY_URL);
       const leafBig = bytes32ToBigInt(credentialHash);
@@ -1060,11 +1088,28 @@ export default function App() {
     } catch (e) {
       const sel = extractRevertSelector(e);
       const decoded = decodeCustomErrorSelector(sel);
-      if (String(e?.message || e) === "NotIssuer") return;
+      if (String(e?.message || e) === "NotIssuer" || String(e?.message || e) === "LeafAlreadyIssued") return;
       setError(String(e?.message || e));
       setStatus("");
       setToast({ tone: "error", title: decoded?.title || "Transaction failed", message: decoded?.message || String(e?.message || e) });
     }
+  }
+
+  async function markOnChainIssuedIfNeeded() {
+    if (!selectedAppId || !credentialHash) return;
+    const onChain = await isCredentialHashOnChain(credentialHash);
+    if (!onChain) {
+      setToast({ tone: "error", title: "Not on-chain yet", message: "Issue the credential first, or wait for the previous tx to confirm." });
+      return;
+    }
+    await markIssued(selectedAppId, lastTx || "on-chain", {
+      merkleRoot: merkleRoot || "",
+      credentialHash,
+      subjectId,
+    });
+    setSelectedAppId("");
+    setIssuerStep(3);
+    setToast({ tone: "success", title: "Queue updated", message: "Application marked issued (credential was already on-chain)." });
   }
 
   async function uploadEncryptedDoc() {
@@ -1716,6 +1761,13 @@ export default function App() {
                                   if (a.credentialHash) setCredentialHash(a.credentialHash);
                                   if (a.incomeCommitment) setIncomeCommitmentHex(a.incomeCommitment);
                                   if (a.merkleRoot) setMerkleRoot(a.merkleRoot);
+                                  if (a.credentialHash) {
+                                    isCredentialHashOnChain(a.credentialHash)
+                                      .then(setSelectedCredOnChain)
+                                      .catch(() => setSelectedCredOnChain(false));
+                                  } else {
+                                    setSelectedCredOnChain(false);
+                                  }
                                 }}
                                 className="mt-1 h-4 w-4 accent-blue-600"
                               />
@@ -1904,22 +1956,43 @@ export default function App() {
                       </div>
                     </Field>
 
+                    {selectedCredOnChain ? (
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+                        This credential hash is <strong>already on-chain</strong> (previous issue succeeded). Do not send
+                        issue again — mark the queue item issued or wait for a new annual renewal application.
+                        <div className="mt-3">
+                          <Button type="button" variant="secondary" onClick={() => markOnChainIssuedIfNeeded().catch((e) => setError(String(e?.message || e)))}>
+                            Mark application as issued
+                          </Button>
+                        </div>
+                      </div>
+                    ) : null}
+
                     <Button
                       onClick={() =>
                         issueCredential()
                           .then(() => {
                             setIssuerStep(3);
                             setSelectedAppId("");
+                            setSelectedCredOnChain(false);
                           })
                           .catch((e) => setError(String(e?.message || e)))
                       }
-                      disabled={!account || (!isCurrentIssuer && !isAdmin) || !selectedAppId || !selectedAppDocsReady}
+                      disabled={
+                        !account ||
+                        (!isCurrentIssuer && !isAdmin) ||
+                        !selectedAppId ||
+                        !selectedAppDocsReady ||
+                        selectedCredOnChain
+                      }
                       title={
-                        !selectedAppDocsReady
-                          ? "Student must upload income and caste certificates"
-                          : !isCurrentIssuer && !isAdmin
-                            ? "You must be an allowed issuer (or admin) to issue"
-                            : undefined
+                        selectedCredOnChain
+                          ? "This credential is already on-chain"
+                          : !selectedAppDocsReady
+                            ? "Student must upload income and caste certificates"
+                            : !isCurrentIssuer && !isAdmin
+                              ? "You must be an allowed issuer (or admin) to issue"
+                              : undefined
                       }
                     >
                       Issue credential

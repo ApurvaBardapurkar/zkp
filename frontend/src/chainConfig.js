@@ -27,6 +27,7 @@ export const registryAbi = [
   "function revokedCredential(bytes32) view returns (bool)",
   "function merkleRoot() view returns (bytes32)",
   "function leafCount() view returns (uint256)",
+  "function issuedLeaf(bytes32) view returns (bool)",
   "event CredentialIssued(bytes32 indexed subjectId, bytes32 indexed credentialHash, string encryptedDocCid, bytes32 merkleRoot, uint256 expiresAt)",
   "event CredentialRevoked(bytes32 indexed credentialHash, address indexed revoker)",
 ];
