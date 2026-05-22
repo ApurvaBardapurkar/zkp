@@ -14,23 +14,24 @@ Two Vercel projects:
 1. Vercel → **Add Project** → Import GitHub `ApurvaBardapurkar/zkp`
 2. **Root Directory:** `server`
 3. Framework: **Other** (no override needed; `vercel.json` is in `server/`)
-4. **Environment variables** (Production + Preview):
+4. **Environment variables** (Production + Preview) — **minimum required:**
 
 | Name | Value |
 |------|--------|
 | `PINATA_JWT` | Your Pinata JWT (no space after `=`) |
-| `KV_REST_API_URL` | From Vercel Storage → KV / Upstash |
-| `KV_REST_API_TOKEN` | From same KV integration |
 
-5. **Storage:** Project → Storage → Create **KV** (Upstash) and connect to this project.
+That is enough for **uploads** and **application queue** (stored as JSON on IPFS via Pinata).
+
+5. **Optional** (faster DB than IPFS index):
+
+| Name | Value |
+|------|--------|
+| `KV_REST_API_URL` | Vercel Storage → KV / Upstash |
+| `KV_REST_API_TOKEN` | Same KV store |
+
 6. Deploy → open `https://zkp-neon.vercel.app/health`  
-   Expected: `"pinata":true,"persistence":"kv"`
-
-Optional seed old applications:
-
-```bash
-KV_REST_API_URL=... KV_REST_API_TOKEN=... node scripts/seedKvApplications.js
-```
+   Expected with only Pinata: `"pinata":true,"persistence":"pinata"`  
+   With KV: `"persistence":"kv"`
 
 ---
 

@@ -668,12 +668,17 @@ export default function App() {
   }, [studentProfile]);
 
   useEffect(() => {
-    if (citizenStep !== 4 || hasIssuedCredential) return;
     fetch(`${PINATA_PROXY_URL}/health`)
       .then((r) => r.json())
-      .then((h) => setBackendPinataOk(Boolean(h.pinata)))
-      .catch(() => setBackendPinataOk(false));
-  }, [citizenStep, hasIssuedCredential]);
+      .then((h) => {
+        setBackendPinataOk(Boolean(h.pinata));
+        setBackendPersistence(h?.persistence ?? "unknown");
+      })
+      .catch(() => {
+        setBackendPinataOk(false);
+        setBackendPersistence("unreachable");
+      });
+  }, []);
   const issuerSteps = useMemo(() => ["Pending applications", "Review certificate", "Issue credential", "Done"], []);
 
   const proofIncome = useMemo(() => {
@@ -1337,11 +1342,14 @@ export default function App() {
           <div className="mt-5 overflow-hidden rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
             <div className="font-semibold">Backend cannot save applications yet</div>
             <p className="mt-2">
-              The API at <span className="font-mono">{PINATA_PROXY_URL}</span> is deployed without KV storage. In the{" "}
-              <strong>zkp-neon</strong> Vercel project, connect <strong>Storage → KV (Upstash)</strong>, then redeploy.
-              After redeploy, open <span className="font-mono">{PINATA_PROXY_URL}/health</span> — it should show{" "}
-              <span className="font-mono">"persistence":"kv"</span>.
+              Add <span className="font-mono">PINATA_JWT</span> to the <strong>zkp-neon</strong> Vercel project (same JWT as uploads) and redeploy.
+              Applications will persist on IPFS automatically — <strong>no Vercel KV required</strong>.
             </p>
+          </div>
+        ) : backendPersistence === "pinata" ? (
+          <div className="mt-5 overflow-hidden rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
+            <div className="font-semibold">Persistence: Pinata (IPFS)</div>
+            <p className="mt-1">Applications are stored on IPFS via your Pinata account. Only <span className="font-mono">PINATA_JWT</span> is required on the backend.</p>
           </div>
         ) : null}
 

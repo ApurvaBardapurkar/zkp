@@ -3,9 +3,9 @@ const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
 const FormData = require("form-data");
-const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { createPersistence } = require("./persistence");
 
 function envTrim(key) {
   return String(process.env[key] || "").trim();
@@ -28,87 +28,9 @@ function createApp() {
   const upload = multer({ storage: multer.memoryStorage() });
 
   const dataDir = path.join(__dirname, "data");
-  const appsFile = path.join(dataDir, "applications.json");
-  const appsKey = "zk-samvidhan:applications:v1";
-
   const isVercel = Boolean(process.env.VERCEL);
-  const kvRestUrl = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
-  const kvRestToken = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
-  const hasVercelKv = Boolean(kvRestUrl) && Boolean(kvRestToken);
-
-  async function kvGetJson(key, fallback) {
-    const base = kvRestUrl;
-    const token = kvRestToken;
-    const r = await fetch(`${base}/get/${encodeURIComponent(key)}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!r.ok) throw new Error(`KV get failed (${r.status})`);
-    const data = await r.json();
-    const raw = data?.result ?? null;
-    if (!raw) return fallback;
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return fallback;
-    }
-  }
-
-  async function kvSetJson(key, value) {
-    const base = kvRestUrl;
-    const token = kvRestToken;
-    const payload = JSON.stringify(value);
-    const r = await fetch(`${base}/set/${encodeURIComponent(key)}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-    if (!r.ok) throw new Error(`KV set failed (${r.status})`);
-  }
-
-  function ensureDataFile() {
-    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-    if (!fs.existsSync(appsFile)) fs.writeFileSync(appsFile, JSON.stringify({ applications: [] }, null, 2));
-  }
-
-  async function readApps() {
-    if (hasVercelKv) {
-      try {
-        return await kvGetJson(appsKey, { applications: [] });
-      } catch (e) {
-        console.error("KV read failed:", e);
-        return { applications: [] };
-      }
-    }
-    if (isVercel) {
-      // Do not serve bundled applications.json on Vercel — it is read-only and misleads GET while POST fails.
-      return { applications: [] };
-    }
-    try {
-      ensureDataFile();
-      const raw = fs.readFileSync(appsFile, "utf8");
-      return JSON.parse(raw);
-    } catch (e) {
-      console.error("File read failed:", e);
-      return { applications: [] };
-    }
-  }
-
-  async function writeApps(obj) {
-    if (hasVercelKv) {
-      await kvSetJson(appsKey, obj);
-      return;
-    }
-    if (isVercel) {
-      throw new Error(
-        "Persistence not configured on Vercel. Open the zkp-neon project → Storage → connect KV/Upstash → redeploy so KV_REST_API_URL and KV_REST_API_TOKEN are set."
-      );
-    }
-    ensureDataFile();
-    fs.writeFileSync(appsFile, JSON.stringify(obj, null, 2));
-  }
+  const { readApps, writeApps, getStatus } = createPersistence({ dataDir, isVercel });
+  const persistStatus = getStatus();
 
   function getPinataAuthHeader() {
     const jwt = envTrim("PINATA_JWT");
@@ -123,7 +45,15 @@ function createApp() {
   app.get("/health", (_req, res) => {
     res.json({
       ok: true,
-      persistence: hasVercelKv ? "kv" : isVercel ? "none" : "file",
+      persistence: persistStatus.mode,
+      persistenceNote:
+        persistStatus.mode === "pinata"
+          ? "Applications stored as JSON on IPFS via Pinata (no Vercel KV needed)"
+          : persistStatus.mode === "kv"
+            ? "Applications stored in Vercel KV / Upstash"
+            : persistStatus.mode === "file"
+              ? "Local file (dev)"
+              : "Set PINATA_JWT on Vercel for automatic persistence",
       vercel: isVercel,
       pinata: Boolean(envTrim("PINATA_JWT")),
       pinataJwtLength: envTrim("PINATA_JWT").length,
