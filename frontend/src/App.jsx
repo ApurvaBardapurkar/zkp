@@ -10,7 +10,7 @@ import {
   validateProfileForApply,
 } from "./mahadbtSchemes.js";
 import { pinFileToIpfs, pinJsonToIpfs } from "./pinataUpload.js";
-import { ApplicationPrint, ApplicationDetailPanel } from "./ApplicationPrint.jsx";
+import { ApplicationPrint, ApplicationDetailPanel, IssuerDocumentReview } from "./ApplicationPrint.jsx";
 import { DocumentUploadField } from "./DocumentUploadField.jsx";
 import { OneTimeDocsUpload } from "./OneTimeDocsUpload.jsx";
 import {
@@ -19,6 +19,7 @@ import {
   missingOneTimeLabels,
   oneTimeDocsToPayload,
   oneTimeDocsFromApplication,
+  isRenewalApplication,
   ONE_TIME_DOCUMENTS,
 } from "./documentsConfig.js";
 import { buildZkIdentityBundle, bytes32ToBigInt } from "./zkCrypto.js";
@@ -745,12 +746,24 @@ export default function App() {
     return selectedApplication.incomeCertCid || selectedApplication.encryptedDocCid || "";
   }, [selectedApplication]);
 
-  const selectedAppCasteCid = useMemo(() => {
-    if (!selectedApplication) return "";
-    return selectedApplication.casteCertCid || "";
-  }, [selectedApplication]);
+  const selectedAppIsRenewal = useMemo(
+    () => isRenewalApplication(selectedApplication),
+    [selectedApplication]
+  );
 
-  const selectedAppDocsReady = Boolean(selectedAppCertCid && selectedAppCasteCid);
+  const selectedAppOneTimeDocs = useMemo(
+    () => oneTimeDocsFromApplication(selectedApplication),
+    [selectedApplication]
+  );
+
+  const selectedAppDocsReady = useMemo(() => {
+    if (!selectedApplication) return false;
+    const hasIncome = Boolean(selectedAppCertCid);
+    if (selectedAppIsRenewal) {
+      return hasIncome && oneTimeDocsComplete(selectedAppOneTimeDocs);
+    }
+    return hasIncome && oneTimeDocsComplete(selectedAppOneTimeDocs);
+  }, [selectedApplication, selectedAppCertCid, selectedAppIsRenewal, selectedAppOneTimeDocs]);
 
   function chooseRole(nextRole) {
     localStorage.setItem("zk_role", nextRole);
@@ -1789,10 +1802,13 @@ export default function App() {
                                 </div>
                                 <div className="mt-1 text-xs text-slate-600">
                                   Policy ID: <span className="font-mono text-slate-900">{a.policyId}</span>
+                                  {a.applicationType === "annual_renewal" ? (
+                                    <span className="text-emerald-700"> · Income only (ZK renewal)</span>
+                                  ) : null}
                                   {(a.incomeCertCid || a.encryptedDocCid) ? (
                                     <>
                                       {" "}
-                                      · Cert:{" "}
+                                      · {a.applicationType === "annual_renewal" ? "Income" : "Cert"}:{" "}
                                       <a
                                         className="font-mono text-blue-700 hover:text-blue-800"
                                         href={ipfsGatewayUrl(a.incomeCertCid || a.encryptedDocCid)}
@@ -1840,32 +1856,37 @@ export default function App() {
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
                     <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 2 — Review documents</div>
                     <div className="mt-2 text-sm text-slate-700">
-                      Verify <strong>income</strong> and <strong>caste</strong> certificates on IPFS before issuing the on-chain credential.
+                      {selectedAppIsRenewal ? (
+                        <>
+                          <strong>ZK annual renewal</strong> — verify only the new <strong>income certificate</strong> for this AY. One-time
+                          documents are already verified from first admission (shown as archive, not re-uploaded).
+                        </>
+                      ) : (
+                        <>
+                          <strong>First admission</strong> — verify income and all one-time documents on IPFS before issuing the initial credential.
+                        </>
+                      )}
                     </div>
-                    {selectedApplication ? <ApplicationDetailPanel application={selectedApplication} ipfsGatewayUrl={ipfsGatewayUrl} /> : null}
+                    {selectedApplication ? (
+                      <IssuerDocumentReview application={selectedApplication} ipfsGatewayUrl={ipfsGatewayUrl} />
+                    ) : null}
                     {!selectedAppDocsReady ? (
                       <div className="mt-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-900">
-                        Missing documents: {!selectedAppCertCid ? "income certificate " : ""}
-                        {!selectedAppCasteCid ? "caste certificate " : ""}— ask the student to re-submit both.
+                        {selectedAppIsRenewal ? (
+                          <>
+                            Missing: {!selectedAppCertCid ? "income certificate for this year " : ""}
+                            {!oneTimeDocsComplete(selectedAppOneTimeDocs) ? "first-admission one-time files on record " : ""}
+                            — ask the student to complete annual renewal or fix first admission archive.
+                          </>
+                        ) : (
+                          <>
+                            Missing documents: {!selectedAppCertCid ? "income certificate " : ""}
+                            {!oneTimeDocsComplete(selectedAppOneTimeDocs) ? "one or more one-time documents " : ""}
+                            — ask the student to re-submit.
+                          </>
+                        )}
                       </div>
-                    ) : (
-                      <div className="mt-3 grid gap-4 md:grid-cols-2">
-                        <div className="rounded-xl border border-slate-200 bg-white p-3">
-                          <div className="text-xs font-semibold uppercase text-slate-600">Income certificate</div>
-                          <a className="mt-2 inline-block text-sm font-semibold text-blue-700" href={ipfsGatewayUrl(selectedAppCertCid)} target="_blank" rel="noreferrer">
-                            Open on IPFS →
-                          </a>
-                          <iframe title="Income" src={ipfsGatewayUrl(selectedAppCertCid)} className="mt-2 h-64 w-full rounded-lg border border-slate-200" />
-                        </div>
-                        <div className="rounded-xl border border-slate-200 bg-white p-3">
-                          <div className="text-xs font-semibold uppercase text-slate-600">Caste certificate</div>
-                          <a className="mt-2 inline-block text-sm font-semibold text-blue-700" href={ipfsGatewayUrl(selectedAppCasteCid)} target="_blank" rel="noreferrer">
-                            Open on IPFS →
-                          </a>
-                          <iframe title="Caste" src={ipfsGatewayUrl(selectedAppCasteCid)} className="mt-2 h-64 w-full rounded-lg border border-slate-200" />
-                        </div>
-                      </div>
-                    )}
+                    ) : null}
                     <div className="mt-4 flex items-center justify-between">
                       <Button variant="secondary" type="button" onClick={() => setIssuerStep(0)}>
                         ← Back
@@ -1874,9 +1895,15 @@ export default function App() {
                         type="button"
                         onClick={() => setIssuerStep(2)}
                         disabled={!account || (!isCurrentIssuer && !isAdmin) || !selectedAppDocsReady}
-                        title={!selectedAppDocsReady ? "Both certificates required" : undefined}
+                        title={
+                          !selectedAppDocsReady
+                            ? selectedAppIsRenewal
+                              ? "Income certificate required for this year"
+                              : "All documents required"
+                            : undefined
+                        }
                       >
-                        Documents OK → Issue
+                        {selectedAppIsRenewal ? "Income verified → Issue" : "Documents OK → Issue"}
                       </Button>
                     </div>
                   </div>

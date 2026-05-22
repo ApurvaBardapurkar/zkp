@@ -48,3 +48,7 @@ export function oneTimeDocsComplete(docs) {
 export function missingOneTimeLabels(docs) {
   return ONE_TIME_DOCUMENTS.filter((d) => d.required && !docs[d.key]?.cid).map((d) => d.label);
 }
+
+export function isRenewalApplication(app) {
+  return app?.applicationType === "annual_renewal";
+}
