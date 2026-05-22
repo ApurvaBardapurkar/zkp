@@ -7,27 +7,26 @@ export function ZkArchitecturePanel({ compact = false }) {
   const layers = [
     {
       step: "1",
-      title: "Private verification (off-chain)",
+      title: "Initial trust verification (real documents)",
       color: "slate",
-      body: "Student uploads PDFs to IPFS via the portal. Only the institute (issuer) reviews files. Nothing raw is written to the blockchain.",
-      items: ["Income certificate (each year)", "One-time docs at first admission: caste, ration, domicile, CAP, admission"],
+      body: "Student uploads PDFs; college/government issuer checks them normally. ZKP does not replace this step — it replaces repeated disclosure later.",
+      items: ["Income certificate", "Caste certificate", "Ration card, domicile, CAP, admission letter", "Profile (MahaDBT-style) — reviewed on IPFS, not on-chain"],
     },
     {
       step: "2",
-      title: "Verifiable credential (on-chain)",
+      title: "Credential issuance (issuer attestation)",
       color: "blue",
-      body: "After manual verification, the issuer publishes a credential: Poseidon hashes + Merkle leaf. This is Web3 trust — not the PDFs.",
+      body: "After approval, issuer signs a cryptographic credential on MST: eligibility attributes are bound as hashes (not PDFs).",
       items: [
-        "subjectId (pseudonymous Citizen ID)",
-        "credentialHash (binds policy, income commitment, doc hashes, caste, domicile)",
-        "merkleRoot + expiry",
+        "Logical claims: verified student, income under limit, eligible category, valid admission (bound in credentialHash)",
+        "subjectId + Merkle leaf + expiry on Registry V2",
       ],
     },
     {
       step: "3",
-      title: "ZK claim — selective disclosure (Groth16)",
+      title: "ZK proof at renewal / claim (Groth16)",
       color: "violet",
-      body: "Each academic year the student generates a proof in the browser. No PDFs are sent again. The chain only sees the proof + 7 public fields.",
+      body: "Wallet/browser proves: “I hold a valid issuer credential where conditions match” — without sending PDFs, Aadhaar, or exact income again.",
       items: [
         "Proves: same student (identity secret → subjectId)",
         "Proves: institute-issued credential (Merkle membership)",
@@ -81,10 +80,23 @@ export function ZkArchitecturePanel({ compact = false }) {
         ))}
       </div>
 
+      <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700">
+        <div className="mb-1 font-sans font-semibold text-slate-800">Logical credential (bound inside credentialHash, not stored as JSON on-chain):</div>
+        {"{"}
+        <br />
+        &nbsp;&nbsp;"student_verified": true,
+        <br />
+        &nbsp;&nbsp;"income_below_scheme_limit": true,
+        <br />
+        &nbsp;&nbsp;"category_eligible": true,
+        <br />
+        &nbsp;&nbsp;"domicile_maharashtra": true
+        <br />
+        {"}"}
+      </div>
       <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-3 py-2 text-xs text-slate-700">
-        <strong>At renewal / claim</strong> the student does <em>not</em> send caste certificate, ration card, or full profile again. The proof shows eligibility from the{" "}
-        <span className="font-semibold">already-issued credential</span> plus private witnesses (income, category, doc hashes). Only the institute re-verifies{" "}
-        <strong>new income PDF</strong> off-chain before re-issuing an updated credential for that year.
+        <strong>Real-world ZKP pattern (this project):</strong> (1) first-time document verification → (2) credential issuance → (3) blockchain anchor → (4) ZK renewal/reuse.
+        Annual renewal: institute re-checks <strong>new income PDF only</strong>; student ZK-claims without re-uploading caste/ration/domicile/CAP/admission.
       </div>
     </div>
   );
