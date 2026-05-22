@@ -12,11 +12,29 @@ import {
 import { pinFileToIpfs, pinJsonToIpfs } from "./pinataUpload.js";
 import { ApplicationPrint, ApplicationDetailPanel } from "./ApplicationPrint.jsx";
 import { DocumentUploadField } from "./DocumentUploadField.jsx";
-
-const MST_CHAIN_ID_DEC = 91562037;
-const MST_CHAIN_ID_HEX = "0x05752B65"; // 91562037
-const MST_RPC_URL = "https://testnetrpc.mstblockchain.com";
-const MST_EXPLORER = "https://testnet.mstscan.com";
+import { buildZkIdentityBundle, bytes32ToBigInt } from "./zkCrypto.js";
+import {
+  appendLeafPoseidon,
+  syncMerkleFromServer,
+  pushLeafToServer,
+  buildMerkleProofForLeafIndex,
+} from "./merklePoseidon.js";
+import { assertZkArtifactsAvailable, ZK_WASM_URL, ZK_ZKEY_URL } from "./zkArtifacts.js";
+import { LiveDeploymentBar } from "./LiveDeploymentBar.jsx";
+import {
+  MST_CHAIN_ID_DEC,
+  MST_CHAIN_ID_HEX,
+  MST_RPC_URL,
+  MST_EXPLORER,
+  REGISTRY_ADDRESS,
+  GATE_ADDRESS,
+  VERIFIER_ADDRESS,
+  addrLink,
+  txLink,
+  assertChainConfig,
+  registryContract,
+  gateContract,
+} from "./chainConfig.js";
 
 // bn128 scalar field (same as snarkjs verifier uses)
 const SNARK_FIELD_R = BigInt("21888242871839275222246405745257275088548364400416034343698204186575808495617");
@@ -74,27 +92,6 @@ const SCHOLARSHIP_PROGRAMS = [
       "Scholarship tier for OBC/SBC/VJNT (example). Freeship tier may apply up to ₹8L.",
     notes: ["Scholarship tier income limit: ≤ ₹1,00,000/year"],
   },
-];
-
-// Deployed (real ZK)
-const REGISTRY_ADDRESS = "0x2E6868823759c648015550f9a2dE666ded78b14f";
-// NOTE: For yearly renewal enforcement, deploy `ScholarshipGateGroth16Epoch` and paste its address here.
-const GATE_GROTH16_ADDRESS = import.meta.env.VITE_GATE_ADDRESS || "0x1742865959509B986383286b062e569eA79eCFe7";
-
-const registryAbi = [
-  "function admin() view returns (address)",
-  "function setIssuer(address issuer, bool allowed) external",
-  "function issueCredential(bytes32 subjectId, bytes32 credentialHash, string encryptedDocCid) external",
-  "function isIssuer(address) view returns (bool)",
-  "function credentialHashBySubject(bytes32) view returns (bytes32)",
-  "function nullifierUsed(bytes32) view returns (bool)",
-  "event CredentialIssued(bytes32 indexed subjectId, bytes32 indexed credentialHash, string encryptedDocCid)",
-];
-
-const gateAbi = [
-  "function verifyAndClaim(uint256[2] a, uint256[2][2] b, uint256[2] c, uint256[5] input) external",
-  "function claimed(bytes32 subjectId, uint256 policyId, uint256 epoch) view returns (bool)",
-  "event VerifiedAndClaimed(bytes32 indexed subjectId, bytes32 indexed nullifierHash, uint256 indexed policyId, uint256 epoch, address caller)",
 ];
 
 /** Academic years for annual renewal claims (one on-chain claim per year). */
@@ -208,13 +205,6 @@ function extractRevertSelector(err) {
   return null;
 }
 
-function txLink(hash) {
-  return `${MST_EXPLORER}/tx/${hash}`;
-}
-
-function addrLink(addr) {
-  return `${MST_EXPLORER}/address/${addr}`;
-}
 
 async function requireWallet() {
   if (!window.ethereum) throw new Error("No wallet found. Install MetaMask.");
@@ -481,11 +471,14 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [backendPersistence, setBackendPersistence] = useState(null);
+  const [merkleRoot, setMerkleRoot] = useState("");
+  const [incomeCommitmentHex, setIncomeCommitmentHex] = useState("");
 
   const explorerLinks = useMemo(
     () => ({
       registry: addrLink(REGISTRY_ADDRESS),
-      gate: addrLink(GATE_GROTH16_ADDRESS),
+      gate: addrLink(GATE_ADDRESS),
+      verifier: addrLink(VERIFIER_ADDRESS),
     }),
     []
   );
@@ -536,13 +529,6 @@ export default function App() {
     setMyApplications(data.applications || []);
   }, [account, fetchJson]);
 
-  useEffect(() => {
-    fetch(`${PINATA_PROXY_URL}/health`)
-      .then((r) => r.json())
-      .then((h) => setBackendPersistence(h?.persistence ?? "unknown"))
-      .catch(() => setBackendPersistence("unreachable"));
-  }, []);
-
   const hasSubmittedPending = useMemo(
     () => myApplications.some((a) => (a.status || "submitted") === "submitted"),
     [myApplications]
@@ -579,7 +565,7 @@ export default function App() {
 
       // Read registry roles
       const readProvider = new ethers.JsonRpcProvider(MST_RPC_URL);
-      const registry = new ethers.Contract(REGISTRY_ADDRESS, registryAbi, readProvider);
+      const registry = registryContract(ethers, readProvider);
       const [adminAddr, issuerFlag] = await Promise.all([registry.admin(), registry.isIssuer(addr)]);
       setRegistryAdmin(adminAddr);
       setIsAdmin(adminAddr.toLowerCase() === addr.toLowerCase());
@@ -594,29 +580,40 @@ export default function App() {
         fetchMyApplications().catch(() => {});
       }
 
-      // Load credential state so renewal UX can be enforced.
+      // Load credential state (ZK Citizen ID, not wallet hash).
       try {
-        const sid = fieldReduceBytes32(ethers.keccak256(ethers.solidityPacked(["address"], [addr])));
+        await assertChainConfig(ethers, readProvider);
+        const gateProbe = gateContract(ethers, readProvider);
+
+        let sid = subjectId;
+        if (role === "citizen") {
+          sid = await deriveSubjectIdFromConnectedWallet();
+        } else {
+          sid = isBytes32Hex(subjectId)
+            ? subjectId
+            : fieldReduceBytes32(ethers.keccak256(ethers.solidityPacked(["address"], [addr])));
+        }
+
         const stored = await registry.credentialHashBySubject(sid);
         const has = stored && stored !== "0x0000000000000000000000000000000000000000000000000000000000000000";
         setHasIssuedCredential(Boolean(has));
         if (has) setCredentialHash(stored);
         setSubjectId(sid);
+
         if (role === "citizen") {
-          const gate = new ethers.Contract(GATE_GROTH16_ADDRESS, gateAbi, readProvider);
           const pid = BigInt(policyId || "0");
           const out = {};
           for (const y of ACADEMIC_YEARS) {
-            try {
-              out[y] = await gate.claimed(sid, pid, BigInt(y));
-            } catch {
-              out[y] = false;
-            }
+            out[y] = await gateProbe.claimed(sid, pid, BigInt(y));
           }
           setClaimedEpochs(out);
         }
-      } catch {
+      } catch (credErr) {
         setHasIssuedCredential(false);
+        console.warn("credential/claimed load:", credErr);
+        if (String(credErr?.message || credErr).includes("misconfigured") || String(credErr?.message || credErr).includes("mismatch")) {
+          setError(String(credErr?.message || credErr));
+        }
       }
 
       // Role-based default view (after user chooses role)
@@ -679,12 +676,13 @@ export default function App() {
         setBackendPersistence("unreachable");
       });
   }, []);
+
   const issuerSteps = useMemo(() => ["Pending applications", "Review certificate", "Issue credential", "Done"], []);
 
   const proofIncome = useMemo(() => {
-    const limit = Number(selectedProgram?.incomeLimitINR || threshold || 800000);
-    return Math.max(1, Math.floor(limit * 0.5));
-  }, [selectedProgram, threshold]);
+    const raw = studentProfile?.familyAnnualIncome || income || "0";
+    return Math.max(1, Math.floor(Number(String(raw).replace(/,/g, "")) || 0));
+  }, [studentProfile, income]);
 
   const selectedAppCertCid = useMemo(() => {
     if (!selectedApplication) return "";
@@ -714,50 +712,60 @@ export default function App() {
     setToast(null);
   }
 
-  function deriveSubjectIdFromConnectedWallet() {
+  async function buildZkBundleForClaim(epochOverride) {
+    const certCid = incomeCertCid || studentDocCid || encryptedDocCid || selectedApplication?.incomeCertCid || "";
+    const casteCid = casteCertCid || selectedApplication?.casteCertCid || "";
+    const prof = selectedApplication?.applicantProfile || studentProfile;
+    const incomeVal = prof?.familyAnnualIncome || proofIncome;
+    const bundle = await buildZkIdentityBundle({
+      incomeINR: incomeVal,
+      policyId: selectedApplication?.policyId || policyId,
+      epoch: epochOverride ?? epoch,
+      incomeCertCid: certCid,
+      casteCertCid: casteCid,
+      caste: prof?.casteCategory || studentProfile?.casteCategory || "OPEN",
+      domicileMH: (prof?.domicileMH ?? studentProfile?.domicileMH) !== false,
+    });
+    setSubjectId(bundle.subjectId);
+    setCredentialHash(bundle.credentialHash);
+    setNullifierHash(bundle.nullifierHash);
+    setIncomeCommitmentHex(bundle.incomeCommitment);
+    return bundle;
+  }
+
+  async function deriveSubjectIdFromConnectedWallet() {
     if (!account) throw new Error("Connect wallet first.");
-    // Deterministic privacy-preserving subjectId derived from wallet address.
-    // Anyone can compute it from the address, so for stronger privacy you can use a secret commitment instead.
-    const sidRaw = ethers.keccak256(ethers.solidityPacked(["address"], [account]));
-    const sid = fieldReduceBytes32(sidRaw);
-    setSubjectId(sid);
-    return sid;
+    const bundle = await buildZkBundleForClaim(epoch);
+    return bundle.subjectId;
   }
 
-  function deriveSubjectIdFromAddress(addr) {
+  async function deriveSubjectIdFromAddress(addr) {
     if (!ethers.isAddress(addr)) throw new Error("Enter a valid citizen wallet address (0x…).");
-    const sidRaw = ethers.keccak256(ethers.solidityPacked(["address"], [addr]));
-    const sid = fieldReduceBytes32(sidRaw);
-    setSubjectId(sid);
-    return sid;
+    setCitizenWallet(addr);
+    const app = applications.find((a) => (a.citizenAddress || "").toLowerCase() === addr.toLowerCase());
+    if (app?.subjectId) {
+      setSubjectId(app.subjectId);
+      if (app.credentialHash) setCredentialHash(app.credentialHash);
+      if (app.incomeCommitment) setIncomeCommitmentHex(app.incomeCommitment);
+      return app.subjectId;
+    }
+    throw new Error("Citizen must submit application first (Citizen ID is derived from their private ZK secret).");
   }
 
-  function generateNewNullifier() {
-    const n = randomBytes32();
-    setNullifierHash(n);
-    return n;
+  async function generateNewNullifier() {
+    const bundle = await buildZkBundleForClaim(epoch);
+    return bundle.nullifierHash;
   }
 
-  function generateCredentialHashFromInputs() {
-    // Scholarship MVP convenience:
-    // Issuer and citizen must use the SAME credentialHash.
-    // We keep it based only on PUBLIC stable inputs (subjectId + policyId + schema tag),
-    // not on private income values.
-    // Production: replace with issuer signature / Merkle inclusion + Poseidon.
-    const packed = ethers.solidityPacked(
-      ["string", "bytes32", "uint256"],
-      ["ZK-SAMVIDHAN:PANJABRAO-DESHMUKH@1", subjectId, BigInt(policyId || "0")]
-    );
-    const hRaw = ethers.keccak256(packed);
-    const h = fieldReduceBytes32(hRaw);
-    setCredentialHash(h);
-    return h;
+  async function generateCredentialHashFromInputs() {
+    const bundle = await buildZkBundleForClaim(epoch);
+    return bundle.credentialHash;
   }
 
   async function refreshClaimedEpochs() {
     if (!isBytes32Hex(subjectId)) return {};
     const readProvider = new ethers.JsonRpcProvider(MST_RPC_URL);
-    const gate = new ethers.Contract(GATE_GROTH16_ADDRESS, gateAbi, readProvider);
+    const gate = gateContract(ethers, readProvider);
     const pid = BigInt(policyId || "0");
     const out = {};
     for (const y of ACADEMIC_YEARS) {
@@ -805,9 +813,9 @@ export default function App() {
 
   async function checkIfCredentialExistsForConnectedWallet() {
     if (!account) throw new Error("Connect wallet first.");
-    const sid = deriveSubjectIdFromConnectedWallet();
+    const sid = await deriveSubjectIdFromConnectedWallet();
     const provider = new ethers.JsonRpcProvider(MST_RPC_URL);
-    const registry = new ethers.Contract(REGISTRY_ADDRESS, registryAbi, provider);
+    const registry = registryContract(ethers, provider);
     const stored = await registry.credentialHashBySubject(sid);
     const has = stored && stored !== "0x0000000000000000000000000000000000000000000000000000000000000000";
     setHasIssuedCredential(Boolean(has));
@@ -864,7 +872,7 @@ export default function App() {
       const provider = await requireWallet();
       await ensureMstNetwork(provider);
       const signer = await provider.getSigner();
-      const registry = new ethers.Contract(REGISTRY_ADDRESS, registryAbi, signer);
+      const registry = registryContract(ethers, signer);
       const tx = await registry.setIssuer(issuerToSet, issuerAllowed);
       setStatus(`Tx sent: ${tx.hash}`);
       setLastTx(tx.hash);
@@ -891,17 +899,39 @@ export default function App() {
         setToast({ tone: "error", title: "Not authorized", message: "You are not an allowed Issuer. Ask admin to allowlist your wallet (Set issuer)." });
         throw new Error("NotIssuer");
       }
+      if (!isBytes32Hex(subjectId) || !isBytes32Hex(credentialHash)) {
+        throw new Error("Load Citizen ID + credential hash from the pending application first.");
+      }
+      const leaves = await syncMerkleFromServer(PINATA_PROXY_URL);
+      const leafBig = bytes32ToBigInt(credentialHash);
+      const merkle = await appendLeafPoseidon(leaves, leafBig);
+      await pushLeafToServer(PINATA_PROXY_URL, merkle.leafHex);
+      setMerkleRoot(merkle.root);
+
+      const expiresAt = Math.floor(Date.now() / 1000) + 86400 * 365 * 5;
       const provider = await requireWallet();
       await ensureMstNetwork(provider);
       const signer = await provider.getSigner();
-      const registry = new ethers.Contract(REGISTRY_ADDRESS, registryAbi, signer);
-      const tx = await registry.issueCredential(subjectId, credentialHash, encryptedDocCid || "");
+      const registry = registryContract(ethers, signer);
+      const tx = await registry.issueCredential(
+        subjectId,
+        credentialHash,
+        encryptedDocCid || "",
+        merkle.root,
+        expiresAt
+      );
       setStatus(`Tx sent: ${tx.hash}`);
       setLastTx(tx.hash);
       setToast({ tone: "loading", title: "Credential tx sent", message: "Waiting for confirmation…", href: txLink(tx.hash), hrefLabel: "View tx" });
       await tx.wait();
       if (selectedAppId) {
-        await markIssued(selectedAppId, tx.hash);
+        await markIssued(selectedAppId, tx.hash, {
+          merkleRoot: merkle.root,
+          merklePathElements: merkle.pathElements,
+          merklePathIndices: merkle.pathIndices,
+          credentialHash,
+          subjectId,
+        });
       }
       setStatus("Credential issued.");
       setToast({ tone: "success", title: "Credential issued", message: "Citizen can now prove eligibility with ZK." });
@@ -963,7 +993,7 @@ export default function App() {
     setToast({ tone: "loading", title: "Preparing claim", message: "Checking credential + nullifier on-chain..." });
 
     const readProvider = new ethers.JsonRpcProvider(MST_RPC_URL);
-    const registryRead = new ethers.Contract(REGISTRY_ADDRESS, registryAbi, readProvider);
+    const registryRead = registryContract(ethers, readProvider);
     if (!isBytes32Hex(subjectId) || !isBytes32Hex(credentialHash) || !isBytes32Hex(nullifierHash)) {
       throw new Error("subjectId / credentialHash / nullifierHash must be valid bytes32 hex (0x + 64 hex chars).");
     }
@@ -990,7 +1020,7 @@ export default function App() {
       throw new Error("This nullifierHash is already used. Change it (must be unique per claim).");
     }
 
-    const gateRead = new ethers.Contract(GATE_GROTH16_ADDRESS, gateAbi, readProvider);
+    const gateRead = gateContract(ethers, readProvider);
     const epochNum = BigInt(epoch || "0");
     if (!ACADEMIC_YEARS.map(String).includes(String(epoch))) {
       throw new Error(`Pick a valid academic year: ${ACADEMIC_YEARS.join(", ")}.`);
@@ -1003,19 +1033,57 @@ export default function App() {
     setStatus("Generating ZK proof in browser… (this can take a bit)");
     setToast({ tone: "loading", title: "Generating proof", message: "Creating a Groth16 proof in your browser..." });
 
+    const bundle = await buildZkBundleForClaim(epoch);
+    const myApp =
+      myApplications.find((a) => a.status === "issued") ||
+      myApplications.find((a) => a.credentialHash) ||
+      null;
+    let pathElements = myApp?.merklePathElements;
+    let pathIndices = myApp?.merklePathIndices;
+    let rootHex = myApp?.merkleRoot || merkleRoot;
+
+    if (!pathElements?.length) {
+      const merkleState = await syncMerkleFromServer(PINATA_PROXY_URL);
+      const leafField = bytes32ToBigInt(bundle.credentialHash).toString();
+      const leafIdx = merkleState.findIndex((l) => String(l) === leafField || String(l).toLowerCase() === bundle.credentialHash.toLowerCase());
+      if (leafIdx < 0) {
+        throw new Error("Merkle proof not found. Ask issuer to re-issue or sync applications.");
+      }
+      const proof = await buildMerkleProofForLeafIndex(merkleState, leafIdx);
+      pathElements = proof.pathElements;
+      pathIndices = proof.pathIndices;
+      rootHex = proof.root;
+    }
+
+    const readReg = registryContract(ethers, readProvider);
+    const onChainRoot = await readReg.merkleRoot();
+    if (onChainRoot && onChainRoot !== "0x0000000000000000000000000000000000000000000000000000000000000000") {
+      rootHex = onChainRoot;
+    }
+    setMerkleRoot(rootHex);
+
     const input = {
-      income: proofIncome,
-      subjectId: BigInt(subjectId).toString(),
-      credentialHash: BigInt(credentialHash).toString(),
-      nullifierHash: BigInt(nullifierHash).toString(),
+      income: bundle.income,
+      incomeSalt: bundle.incomeSalt,
+      identitySecret: bundle.identitySecret,
+      casteCategory: bundle.casteCategory,
+      domicileMH: bundle.domicileMH,
+      incomeCertHash: bundle.incomeCertHash,
+      casteCertHash: bundle.casteCertHash,
+      merklePathElements: pathElements,
+      merklePathIndices: pathIndices,
+      subjectId: BigInt(bundle.subjectId).toString(),
+      credentialHash: BigInt(bundle.credentialHash).toString(),
+      nullifierHash: BigInt(bundle.nullifierHash).toString(),
       policyId: BigInt(policyId).toString(),
       epoch: BigInt(epoch || "0").toString(),
+      incomeCommitment: bundle.incomeCommitment,
+      merkleRoot: BigInt(rootHex).toString(),
     };
 
-    const wasmPath = "/zk/incomeEligibility_js/incomeEligibility.wasm";
-    const zkeyPath = "/zk/circuit_final.zkey";
+    await assertZkArtifactsAvailable();
 
-    const { proof, publicSignals } = await snarkjs.groth16.fullProve(input, wasmPath, zkeyPath);
+    const { proof, publicSignals } = await snarkjs.groth16.fullProve(input, ZK_WASM_URL, ZK_ZKEY_URL);
 
     const callData = await snarkjs.groth16.exportSolidityCallData(proof, publicSignals);
     const parsed = JSON.parse("[" + callData + "]");
@@ -1026,7 +1094,7 @@ export default function App() {
     const provider = await requireWallet();
     await ensureMstNetwork(provider);
     const signer = await provider.getSigner();
-    const gate = new ethers.Contract(GATE_GROTH16_ADDRESS, gateAbi, signer);
+    const gate = gateContract(ethers, signer);
     const tx = await gate.verifyAndClaim(a, b, c, pub);
     setStatus(`Tx sent: ${tx.hash}`);
     setLastTx(tx.hash);
@@ -1052,8 +1120,8 @@ export default function App() {
       const latest = await provider.getBlockNumber();
       const from = Math.max(0, latest - 50_000);
 
-      const registry = new ethers.Contract(REGISTRY_ADDRESS, registryAbi, provider);
-      const gate = new ethers.Contract(GATE_GROTH16_ADDRESS, gateAbi, provider);
+      const registry = registryContract(ethers, provider);
+      const gate = gateContract(ethers, provider);
 
       const [issued, claimed] = await Promise.all([
         registry.queryFilter(registry.filters.CredentialIssued(), from, latest),
@@ -1125,6 +1193,19 @@ export default function App() {
     } catch (e) {
       console.warn("snapshot pin failed", e);
     }
+    const zkBundle = await buildZkIdentityBundle({
+      incomeINR: proofIncome,
+      policyId,
+      epoch: epoch || defaultAcademicYear(),
+      incomeCertCid: certCid,
+      casteCertCid: casteCertCid || "",
+      caste: studentProfile?.casteCategory || "OPEN",
+      domicileMH: studentProfile?.domicileMH !== false,
+    });
+    setSubjectId(zkBundle.subjectId);
+    setCredentialHash(zkBundle.credentialHash);
+    setIncomeCommitmentHex(zkBundle.incomeCommitment);
+
     const body = {
       citizenAddress: account,
       programKey,
@@ -1140,6 +1221,9 @@ export default function App() {
       applicationYear: epoch || defaultAcademicYear(),
       applicantProfile: { ...studentProfile, wallet: account },
       applicationSnapshotCid: snapshotCid || "",
+      subjectId: zkBundle.subjectId,
+      credentialHash: zkBundle.credentialHash,
+      incomeCommitment: zkBundle.incomeCommitment,
     };
     await fetchJson(`${PINATA_PROXY_URL}/applications`, {
       method: "POST",
@@ -1151,11 +1235,19 @@ export default function App() {
     setCitizenStep(5);
   }
 
-  async function markIssued(appId, txHash) {
+  async function markIssued(appId, txHash, zkMeta = {}) {
     await fetchJson(`${PINATA_PROXY_URL}/applications/${appId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "issued", issuedTxHash: txHash }),
+      body: JSON.stringify({
+        status: "issued",
+        issuedTxHash: txHash,
+        merkleRoot: zkMeta.merkleRoot || "",
+        merklePathElements: zkMeta.merklePathElements || [],
+        merklePathIndices: zkMeta.merklePathIndices || [],
+        credentialHash: zkMeta.credentialHash || "",
+        subjectId: zkMeta.subjectId || "",
+      }),
     });
     await fetchApplications();
   }
@@ -1254,6 +1346,11 @@ export default function App() {
           <div className="text-slate-600">
             Issue a credential hash, encrypt documents client-side, generate a Groth16 proof in-browser, and verify on-chain without exposing income.
           </div>
+          <LiveDeploymentBar
+            pinataProxyUrl={PINATA_PROXY_URL}
+            persistence={backendPersistence}
+            pinataOk={backendPinataOk}
+          />
         </div>
         ) : null}
 
@@ -1261,11 +1358,14 @@ export default function App() {
         <div className="mt-6 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div className="flex flex-wrap items-center gap-3">
             <Button onClick={connect}>{account ? `Connected: ${short(account)}` : "Connect Wallet"}</Button>
-            <a className="text-sm text-slate-600 hover:text-slate-900" href={explorerLinks.registry} target="_blank" rel="noreferrer">
-              Registry
+            <a className="text-sm text-slate-600 hover:text-slate-900" href={explorerLinks.registry} target="_blank" rel="noreferrer" title={REGISTRY_ADDRESS}>
+              Registry {short(REGISTRY_ADDRESS)}
             </a>
-            <a className="text-sm text-slate-600 hover:text-slate-900" href={explorerLinks.gate} target="_blank" rel="noreferrer">
-              Gate
+            <a className="text-sm text-slate-600 hover:text-slate-900" href={explorerLinks.gate} target="_blank" rel="noreferrer" title={GATE_ADDRESS}>
+              Gate {short(GATE_ADDRESS)}
+            </a>
+            <a className="text-sm text-slate-600 hover:text-slate-900" href={explorerLinks.verifier} target="_blank" rel="noreferrer" title={VERIFIER_ADDRESS}>
+              Verifier
             </a>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1488,13 +1588,10 @@ export default function App() {
                                   setEncryptedDocCid(a.encryptedDocCid || "");
                                   const cert = a.incomeCertCid || a.encryptedDocCid || "";
                                   loadIssuerCertificatePreview(cert).catch(() => {});
-                                  try {
-                                    const sid = deriveSubjectIdFromAddress(a.citizenAddress);
-                                    generateCredentialHashFromInputs();
-                                    copyText(sid).catch(() => {});
-                                  } catch {
-                                    // ignore - user can derive manually in Step 3
-                                  }
+                                  if (a.subjectId) setSubjectId(a.subjectId);
+                                  if (a.credentialHash) setCredentialHash(a.credentialHash);
+                                  if (a.incomeCommitment) setIncomeCommitmentHex(a.incomeCommitment);
+                                  if (a.merkleRoot) setMerkleRoot(a.merkleRoot);
                                 }}
                                 className="mt-1 h-4 w-4 accent-blue-600"
                               />
@@ -1633,22 +1730,22 @@ export default function App() {
                         <Button
                           variant="secondary"
                           type="button"
-                          onClick={() => {
+                          onClick={async () => {
                             try {
-                              const sid = deriveSubjectIdFromAddress(citizenWallet);
-                              generateCredentialHashFromInputs();
-                              setStatus(`Derived Citizen ID from ${short(citizenWallet)}.`);
+                              const sid = await deriveSubjectIdFromAddress(citizenWallet);
+                              await generateCredentialHashFromInputs();
+                              setStatus(`Loaded Citizen ID from application for ${short(citizenWallet)}.`);
                               copyText(sid).catch(() => {});
                             } catch (e) {
                               setError(String(e?.message || e));
                             }
                           }}
                         >
-                          Derive ID + hash
+                          Load from application
                         </Button>
                       </div>
                       <div className="mt-1 text-xs text-slate-600">
-                        This derives the same <span className="font-semibold text-slate-900">Citizen ID</span> the student sees in the Citizen flow.
+                        Citizen ID is derived from the student&apos;s private ZK secret at application time (not from wallet).
                       </div>
                     </Field>
 
@@ -1658,10 +1755,10 @@ export default function App() {
                         <Button
                           variant="secondary"
                           type="button"
-                          onClick={() => {
+                          onClick={async () => {
                             try {
-                              const h = generateCredentialHashFromInputs();
-                              setStatus("Generated credential hash.");
+                              const h = await generateCredentialHashFromInputs();
+                              setStatus("Generated credential hash (Poseidon).");
                               copyText(h).catch(() => {});
                             } catch (e) {
                               setError(String(e?.message || e));
@@ -1759,8 +1856,9 @@ export default function App() {
                   {historyLoading ? "Refreshing…" : "Refresh"}
                 </Button>
                 <div className="text-xs text-slate-600">
-                  Registry: <a className="text-blue-700 hover:text-blue-800" href={explorerLinks.registry} target="_blank" rel="noreferrer">{short(REGISTRY_ADDRESS)}</a>{" "}
-                  · Gate: <a className="text-blue-700 hover:text-blue-800" href={explorerLinks.gate} target="_blank" rel="noreferrer">{short(GATE_GROTH16_ADDRESS)}</a>
+                  Registry: <a className="text-blue-700 hover:text-blue-800" href={explorerLinks.registry} target="_blank" rel="noreferrer" title={REGISTRY_ADDRESS}>{short(REGISTRY_ADDRESS)}</a>{" "}
+                  · Gate: <a className="text-blue-700 hover:text-blue-800" href={explorerLinks.gate} target="_blank" rel="noreferrer" title={GATE_ADDRESS}>{short(GATE_ADDRESS)}</a>{" "}
+                  · Verifier: <a className="text-blue-700 hover:text-blue-800" href={explorerLinks.verifier} target="_blank" rel="noreferrer" title={VERIFIER_ADDRESS}>{short(VERIFIER_ADDRESS)}</a>
                 </div>
               </div>
 
@@ -2165,23 +2263,23 @@ export default function App() {
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
                     <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 6 — Your Citizen ID</div>
                     <div className="mt-2 rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-700">
-                      Your Citizen ID is derived from your wallet. Issuer uses the same method to issue your scholarship credential.
+                      Your Citizen ID is derived from a private ZK secret in this browser (not your wallet address). Issuer loads the same ID from your submitted application.
                     </div>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
                       <Button
                         variant="secondary"
                         type="button"
-                        onClick={() => {
+                        onClick={async () => {
                           try {
-                            const sid = deriveSubjectIdFromConnectedWallet();
-                            setStatus("Citizen ID derived from your wallet.");
+                            const sid = await deriveSubjectIdFromConnectedWallet();
+                            setStatus("Citizen ID derived from your private ZK secret.");
                             copyText(sid).catch(() => {});
                           } catch (e) {
                             setError(String(e?.message || e));
                           }
                         }}
                       >
-                        Use wallet to generate ID
+                        Generate Citizen ID
                       </Button>
                       <Button
                         variant="secondary"
@@ -2254,9 +2352,9 @@ export default function App() {
                       <Button
                         variant="secondary"
                         type="button"
-                        onClick={() => {
+                        onClick={async () => {
                           try {
-                            const h = generateCredentialHashFromInputs();
+                            const h = await generateCredentialHashFromInputs();
                             setStatus("Generated scholarship credential hash (must match issuer-issued hash).");
                             copyText(h).catch(() => {});
                           } catch (e) {
@@ -2269,9 +2367,9 @@ export default function App() {
                       <Button
                         variant="secondary"
                         type="button"
-                        onClick={() => {
-                          const n = generateNewNullifier();
-                          setStatus("Generated one-time nullifier.");
+                        onClick={async () => {
+                          const n = await generateNewNullifier();
+                          setStatus("Generated one-time nullifier for this academic year.");
                           copyText(n).catch(() => {});
                         }}
                       >

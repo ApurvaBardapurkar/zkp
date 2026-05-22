@@ -37,16 +37,21 @@ Stop-Port 5173
 Stop-Port 5174
 Stop-Port 5175
 
-Write-Host "Syncing ZK artifacts into frontend/public/zk ..." -ForegroundColor Green
+Write-Host "Syncing ZK V2 artifacts into frontend/public/zk ..." -ForegroundColor Green
 $zkPublic = Join-Path $root "frontend\public\zk"
 $zkBuild = Join-Path $root "circuits\build"
-New-Item -ItemType Directory -Force -Path $zkPublic | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $zkPublic "incomeEligibility_js") | Out-Null
+$wasmDir = Join-Path $zkPublic "scholarshipEligibility_js"
+New-Item -ItemType Directory -Force -Path $wasmDir | Out-Null
 
-Copy-Item -Force (Join-Path $zkBuild "circuit_final.zkey") (Join-Path $zkPublic "circuit_final.zkey")
-Copy-Item -Force (Join-Path $zkBuild "incomeEligibility_js\incomeEligibility.wasm") (Join-Path $zkPublic "incomeEligibility_js\incomeEligibility.wasm")
-Copy-Item -Force (Join-Path $zkBuild "incomeEligibility_js\generate_witness.js") (Join-Path $zkPublic "incomeEligibility_js\generate_witness.js")
-Copy-Item -Force (Join-Path $zkBuild "incomeEligibility_js\witness_calculator.js") (Join-Path $zkPublic "incomeEligibility_js\witness_calculator.js")
+if (!(Test-Path (Join-Path $zkBuild "scholarship_final.zkey"))) {
+  Write-Host "Building circuit (first time may take a minute)..." -ForegroundColor Yellow
+  node (Join-Path $root "scripts\buildScholarshipCircuit.js")
+}
+
+Copy-Item -Force (Join-Path $zkBuild "scholarship_final.zkey") (Join-Path $zkPublic "scholarship_final.zkey")
+Copy-Item -Force (Join-Path $zkBuild "scholarshipEligibility_js\scholarshipEligibility.wasm") (Join-Path $wasmDir "scholarshipEligibility.wasm")
+Copy-Item -Force (Join-Path $zkBuild "scholarshipEligibility_js\generate_witness.js") (Join-Path $wasmDir "generate_witness.js")
+Copy-Item -Force (Join-Path $zkBuild "scholarshipEligibility_js\witness_calculator.js") (Join-Path $wasmDir "witness_calculator.js")
 
 Write-Host "Launching backend (Pinata proxy) on http://localhost:8787" -ForegroundColor Green
 Start-Process powershell -WorkingDirectory (Join-Path $root "server") -ArgumentList "-NoExit","-Command","npm run dev"

@@ -11,6 +11,8 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.100.6",
+    "buffer": "^6.0.3",
+    "circomlibjs": "^0.1.7",
     "ethers": "^6.16.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",

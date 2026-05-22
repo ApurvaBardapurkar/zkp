@@ -45,13 +45,30 @@ That is enough for **uploads** and **application queue** (stored as JSON on IPFS
 | Name | Value |
 |------|--------|
 | `VITE_PINATA_PROXY_URL` | `https://zkp-neon.vercel.app` |
-| `VITE_GATE_ADDRESS` | `0xeb381413FA32a566014432A2Ab0B6fC0C1f7F26B` |
+| `VITE_REGISTRY_ADDRESS` | `0x2eFAde234C17318E56a2F4021347D5930136188c` |
+| `VITE_GATE_ADDRESS` | `0x5421baDaeA328eAbcdefD4BAa4F930d85F749330` |
+
+**Do not swap these.** If `VITE_GATE_ADDRESS` is set to the Registry address, `claimed()` calls revert with empty data (`0x8a48fd45` on wrong contract).
 
 5. Deploy → open your frontend URL.
 
 ---
 
-## 3. After deploy — quick test
+## 3. ZK V2 stack (on-chain)
+
+Deployed with `npm run circuit:build` then `npm run deploy:v2:mst`:
+
+| Contract | Address |
+|----------|---------|
+| Registry V2 | `0x2eFAde234C17318E56a2F4021347D5930136188c` |
+| Gate V2 | `0x5421baDaeA328eAbcdefD4BAa4F930d85F749330` |
+| Verifier | `0xb96dE41d804bb6ef6482DDC54b512cBdd6868aD5` |
+
+Circuit: `scholarshipEligibility.circom` — Poseidon identity, income commitment, caste/domicile, Merkle leaf proof.
+
+---
+
+## 4. After deploy — quick test
 
 1. `/health` on backend → `pinata: true`, `persistence: kv`
 2. Citizen → Connect wallet → upload income + caste cert (Choose file → Upload)

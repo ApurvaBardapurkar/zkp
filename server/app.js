@@ -6,6 +6,7 @@ const FormData = require("form-data");
 const path = require("path");
 const crypto = require("crypto");
 const { createPersistence } = require("./persistence");
+const { createMerkleStore } = require("./merkleStore");
 
 function envTrim(key) {
   return String(process.env[key] || "").trim();
@@ -31,6 +32,7 @@ function createApp() {
   const isVercel = Boolean(process.env.VERCEL);
   const { readApps, writeApps, getStatus } = createPersistence({ dataDir, isVercel });
   const persistStatus = getStatus();
+  const merkleStore = createMerkleStore({ readApps, writeApps });
 
   function getPinataAuthHeader() {
     const jwt = envTrim("PINATA_JWT");
@@ -130,6 +132,9 @@ function createApp() {
         schemeName,
         department,
         applicationSnapshotCid,
+        subjectId,
+        credentialHash,
+        incomeCommitment,
       } = req.body || {};
       if (!citizenAddress || !programKey || !policyId) {
         return res.status(400).json({ error: "Missing citizenAddress/programKey/policyId" });
@@ -159,6 +164,9 @@ function createApp() {
         department: department || "",
         applicantProfile: applicantProfile || null,
         applicationSnapshotCid: applicationSnapshotCid || "",
+        subjectId: subjectId || "",
+        credentialHash: credentialHash || "",
+        incomeCommitment: incomeCommitment || "",
         status: "submitted",
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -173,15 +181,51 @@ function createApp() {
     }
   });
 
+  app.get("/merkle", async (_req, res) => {
+    try {
+      const store = await merkleStore.getState();
+      res.json(store);
+    } catch (e) {
+      res.status(500).json({ error: String(e?.message || e) });
+    }
+  });
+
+  app.post("/merkle/leaf", async (req, res) => {
+    try {
+      const { leaf } = req.body || {};
+      if (!leaf) return res.status(400).json({ error: "Missing leaf" });
+      const store = await merkleStore.appendLeaf(leaf);
+      res.json(store);
+    } catch (e) {
+      res.status(500).json({ error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/merkle/proof/:leaf", async (req, res) => {
+    try {
+      const info = await merkleStore.getProofForLeaf(req.params.leaf);
+      if (!info) return res.status(404).json({ error: "Leaf not in tree" });
+      res.json(info);
+    } catch (e) {
+      res.status(500).json({ error: String(e?.message || e) });
+    }
+  });
+
   app.patch("/applications/:id", async (req, res) => {
     try {
       const { id } = req.params;
-      const { status, issuedTxHash } = req.body || {};
+      const { status, issuedTxHash, merkleRoot, merklePathElements, merklePathIndices, credentialHash, subjectId } =
+        req.body || {};
       const store = await readApps();
       const idx = store.applications.findIndex((a) => a.id === id);
       if (idx === -1) return res.status(404).json({ error: "Not found" });
       if (status) store.applications[idx].status = status;
       if (issuedTxHash !== undefined) store.applications[idx].issuedTxHash = issuedTxHash;
+      if (merkleRoot) store.applications[idx].merkleRoot = merkleRoot;
+      if (merklePathElements) store.applications[idx].merklePathElements = merklePathElements;
+      if (merklePathIndices) store.applications[idx].merklePathIndices = merklePathIndices;
+      if (credentialHash) store.applications[idx].credentialHash = credentialHash;
+      if (subjectId) store.applications[idx].subjectId = subjectId;
       store.applications[idx].updatedAt = new Date().toISOString();
       await writeApps(store);
       return res.json(store.applications[idx]);

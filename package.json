@@ -9,6 +9,8 @@
     "deploy:verifier:mst": "hardhat run scripts/deployIncomeVerifier.js --network mstTestnet",
     "deploy:realzk:mst": "hardhat run scripts/deployRealZKGate.js --network mstTestnet",
     "gate:set-verifier:mst": "hardhat run scripts/setGateVerifier.js --network mstTestnet",
+    "circuit:build": "node scripts/buildScholarshipCircuit.js",
+    "deploy:v2:mst": "hardhat run scripts/deployScholarshipV2.js --network mstTestnet",
     "ipfs:pin-json": "node scripts/ipfs/pinJSONToIPFS.js",
     "ipfs:pin-file": "node scripts/ipfs/pinFileToIPFS.js"
   },
@@ -24,6 +26,7 @@
   "dependencies": {
     "axios": "^1.15.2",
     "circomlib": "^2.0.5",
+    "circomlibjs": "^0.1.7",
     "form-data": "^4.0.5",
     "snarkjs": "^0.7.6"
   }
