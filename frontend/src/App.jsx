@@ -22,7 +22,13 @@ import {
   isRenewalApplication,
   ONE_TIME_DOCUMENTS,
 } from "./documentsConfig.js";
-import { buildZkIdentityBundle, bytes32ToBigInt } from "./zkCrypto.js";
+import {
+  buildZkIdentityBundle,
+  bytes32ToBigInt,
+  saveFirstAdmissionBaseline,
+  loadFirstAdmissionBaseline,
+} from "./zkCrypto.js";
+import { ZkArchitecturePanel, ZkClaimProofChecklist } from "./ZkArchitecturePanel.jsx";
 import {
   appendLeafPoseidon,
   syncMerkleFromServer,
@@ -796,6 +802,7 @@ export default function App() {
     const ep = epochOverride ?? epoch;
     const issuedApp = getActiveIssuedAppForEpoch(ep) || selectedApplication || baseIssuedApplication;
     const ot = oneTimeDocsFromApplication(issuedApp);
+    const baseline = loadFirstAdmissionBaseline();
     const certCid =
       (String(ep) === String(epoch) && renewalIncomeCid) ||
       issuedApp?.incomeCertCid ||
@@ -803,7 +810,7 @@ export default function App() {
       studentDocCid ||
       encryptedDocCid ||
       "";
-    const casteCid = ot.casteCert?.cid || issuedApp?.casteCertCid || "";
+    const casteCid = ot.casteCert?.cid || issuedApp?.casteCertCid || baseline?.casteCertCid || "";
     const prof = issuedApp?.applicantProfile || studentProfile;
     const incomeVal = prof?.familyAnnualIncome || proofIncome;
     const bundle = await buildZkIdentityBundle({
@@ -812,8 +819,8 @@ export default function App() {
       epoch: ep,
       incomeCertCid: certCid,
       casteCertCid: casteCid,
-      caste: prof?.casteCategory || studentProfile?.casteCategory || "OPEN",
-      domicileMH: (prof?.domicileMH ?? studentProfile?.domicileMH) !== false,
+      caste: prof?.casteCategory || baseline?.caste || studentProfile?.casteCategory || "OPEN",
+      domicileMH: (prof?.domicileMH ?? baseline?.domicileMH ?? studentProfile?.domicileMH) !== false,
     });
     setSubjectId(bundle.subjectId);
     setCredentialHash(bundle.credentialHash);
@@ -1286,7 +1293,7 @@ export default function App() {
     setToast({
       tone: "success",
       title: "Claimed successfully",
-      message: `Annual eligibility claim recorded for ${epoch}. Income was not re-disclosed.`,
+      message: `Groth16 claim for ${epoch} verified. Documents and exact income were not sent on-chain.`,
       href: txLink(tx.hash),
       hrefLabel: "View proof tx",
     });
@@ -1387,6 +1394,12 @@ export default function App() {
     setSubjectId(zkBundle.subjectId);
     setCredentialHash(zkBundle.credentialHash);
     setIncomeCommitmentHex(zkBundle.incomeCommitment);
+    saveFirstAdmissionBaseline({
+      casteCertCid: oneTimeDocs.casteCert?.cid || "",
+      caste: studentProfile?.casteCategory,
+      domicileMH: studentProfile?.domicileMH,
+      oneTimeDocs,
+    });
 
     const body = {
       citizenAddress: account,
@@ -1487,14 +1500,17 @@ export default function App() {
               <div className="text-sm font-semibold text-blue-700">ZK‑Samvidhan</div>
               <div className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Select portal access</div>
               <div className="mt-2 text-slate-600">
-                Choose the interface you need: Citizen services or Issuer administration.
+                Credential-based verification: PDFs reviewed privately → on-chain credential → Groth16 claim without re-uploading documents.
+              </div>
+              <div className="mt-4">
+                <ZkArchitecturePanel />
               </div>
 
               <div className="mt-6 grid gap-4 md:grid-cols-2">
                 <div className="rounded-2xl border border-slate-200 bg-white p-5">
                   <div className="text-lg font-semibold text-slate-900">Citizen</div>
                   <div className="mt-1 text-sm text-slate-600">
-                    Prove scholarship eligibility with ZK (income ≤ threshold) without revealing your income.
+                    Hold a credential; each year generate a ZK proof (eligible category, income under limit, same student) — not raw PDFs.
                   </div>
                   <div className="mt-4">
                     <Button onClick={() => chooseRole("citizen")}>Continue as Citizen</Button>
@@ -1504,7 +1520,7 @@ export default function App() {
                 <div className="rounded-2xl border border-slate-200 bg-white p-5">
                   <div className="text-lg font-semibold text-slate-900">Issuer</div>
                   <div className="mt-1 text-sm text-slate-600">
-                    Issue scholarship credentials after verification (admin/issuer wallet required).
+                    Verify PDFs off-chain; publish hash credentials + Merkle root on-chain (admin/issuer wallet).
                   </div>
                   <div className="mt-4">
                     <Button onClick={() => chooseRole("issuer")}>Continue as Issuer</Button>
@@ -1526,7 +1542,10 @@ export default function App() {
             Privacy‑Preserving Eligibility Proofs on <span className="text-blue-700">MST Testnet</span>
           </div>
           <div className="text-slate-600">
-            Issue a credential hash, encrypt documents client-side, generate a Groth16 proof in-browser, and verify on-chain without exposing income.
+            Verifiable credentials on MST: institute verifies PDFs privately, issues hash credentials on-chain, students claim yearly with Groth16 — no document re-upload.
+          </div>
+          <div className="mt-3 max-w-4xl">
+            <ZkArchitecturePanel compact />
           </div>
           <LiveDeploymentBar
             pinataProxyUrl={PINATA_PROXY_URL}
@@ -1710,7 +1729,8 @@ export default function App() {
 
                 {issuerStep === 0 ? (
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">Step 1 — Pending applications</div>
+                    <ZkArchitecturePanel compact />
+                    <div className="mt-3 text-xs font-medium uppercase tracking-wide text-slate-600">Step 1 — Pending applications</div>
                     <div className="mt-2 text-sm text-slate-700">
                       Applications are <span className="font-semibold text-slate-900">not</span> created here. Students submit them from the{" "}
                       <span className="font-semibold text-slate-900">Citizen</span> side of this portal (Switch role → Citizen → Connect wallet → Step 2 “Submit application”). This queue shows those rows after the backend saves them.
@@ -2141,7 +2161,7 @@ export default function App() {
           <div className="mt-8 grid gap-5 lg:grid-cols-2">
             <Card
               title="MahaDBT-style Scholarship Portal"
-              subtitle="MahaDBT-style flow: Connect wallet → Academic year → Profile → Eligible schemes → Print & submit → Institute verify → ZK claim."
+              subtitle="PDFs verified privately → on-chain credential → yearly ZK claim (selective disclosure, no re-upload)."
             >
               <div className="grid gap-3 print:hidden">
                 <Stepper steps={citizenSteps} current={citizenStepperIndex} />
@@ -2582,15 +2602,21 @@ export default function App() {
                         <Input value={threshold} disabled />
                       </Field>
                     </div>
-                    <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-slate-800">
+                    <ZkArchitecturePanel compact />
+                    <div className="mt-3 rounded-xl border border-violet-200 bg-violet-50/80 p-3 text-sm text-slate-800">
+                      <strong>Groth16 claim (real ZK):</strong> your browser builds a proof from secrets stored locally plus the institute-issued credential.{" "}
+                      <strong>No PDFs</strong> are sent in this step. Income amount, caste, domicile, and document hashes stay in the{" "}
+                      <em>private witness</em>; the chain checks the proof and only sees the 7 public fields below.
+                    </div>
+                    <ZkClaimProofChecklist />
+                    <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-slate-700">
                       {hasIssuedCredential ? (
                         <>
-                          Renewal: your income was verified at issuance. You do <strong>not</strong> re-upload a certificate or re-enter income. The proof only shows you still meet the scheme limit (≤ ₹
-                          {Number(threshold).toLocaleString("en-IN")}/year).
+                          <strong>Renewal:</strong> you already uploaded new income for AY {epoch} in Step 2; the institute re-issued your credential. This claim proves eligibility for {epoch} without sending caste/ration/domicile/CAP/admission files again.
                         </>
                       ) : (
                         <>
-                          After the institute issues your credential, your claim uses the verified eligibility bound — income amount is not shown in the portal.
+                          After the institute issues your credential, one claim per academic year. Exact income (₹) is not published on-chain — only <code className="rounded bg-white px-1">incomeCommitment</code>.
                         </>
                       )}
                     </div>

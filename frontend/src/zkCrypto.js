@@ -123,6 +123,33 @@ export function getOrCreateIncomeSaltForYear(year) {
   return salt;
 }
 
+/** One-time doc hash bindings from first admission — used at ZK claim without re-reading PDFs. */
+const BASELINE_KEY = "zk_first_admission_baseline";
+
+export function saveFirstAdmissionBaseline({ casteCertCid, caste, domicileMH, oneTimeDocs }) {
+  const ot = oneTimeDocs || {};
+  const payload = {
+    caste: caste || "OPEN",
+    domicileMH: domicileMH !== false,
+    casteCertCid: casteCertCid || ot.casteCert?.cid || "",
+    rationCardCid: ot.rationCard?.cid || "",
+    domicileCertCid: ot.domicileCert?.cid || "",
+    capIdCertCid: ot.capIdCert?.cid || "",
+    admissionLetterCid: ot.admissionLetter?.cid || "",
+    savedAt: new Date().toISOString(),
+  };
+  localStorage.setItem(BASELINE_KEY, JSON.stringify(payload));
+}
+
+export function loadFirstAdmissionBaseline() {
+  try {
+    const raw = localStorage.getItem(BASELINE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function buildZkIdentityBundle({
   incomeINR,
   policyId,
