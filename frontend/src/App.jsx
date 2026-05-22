@@ -1346,11 +1346,6 @@ export default function App() {
               Applications will persist on IPFS automatically — <strong>no Vercel KV required</strong>.
             </p>
           </div>
-        ) : backendPersistence === "pinata" ? (
-          <div className="mt-5 overflow-hidden rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
-            <div className="font-semibold">Persistence: Pinata (IPFS)</div>
-            <p className="mt-1">Applications are stored on IPFS via your Pinata account. Only <span className="font-mono">PINATA_JWT</span> is required on the backend.</p>
-          </div>
         ) : null}
 
         {error ? (
