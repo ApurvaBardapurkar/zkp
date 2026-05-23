@@ -99,12 +99,25 @@ export async function deriveCredentialHash({
   return poseidon3(subjectId, policyId, inner);
 }
 
-export function getOrCreateIdentitySecret() {
-  let sk = localStorage.getItem("zk_identity_secret");
-  if (!sk) {
-    sk = randomField();
-    localStorage.setItem("zk_identity_secret", sk);
+export function getOrCreateIdentitySecret(walletAddress) {
+  const legacy = localStorage.getItem("zk_identity_secret");
+  if (walletAddress) {
+    const wkey = `zk_identity_secret_${String(walletAddress).toLowerCase()}`;
+    let sk = localStorage.getItem(wkey);
+    if (!sk && legacy) {
+      sk = legacy;
+      localStorage.setItem(wkey, sk);
+    }
+    if (!sk) {
+      sk = randomField();
+      localStorage.setItem(wkey, sk);
+      localStorage.setItem("zk_identity_secret", sk);
+    }
+    return sk;
   }
+  if (legacy) return legacy;
+  const sk = randomField();
+  localStorage.setItem("zk_identity_secret", sk);
   return sk;
 }
 
@@ -158,8 +171,9 @@ export async function buildZkIdentityBundle({
   casteCertCid,
   caste,
   domicileMH = 1,
+  walletAddress,
 }) {
-  const identitySecret = bytes32ToBigInt(getOrCreateIdentitySecret());
+  const identitySecret = bytes32ToBigInt(getOrCreateIdentitySecret(walletAddress || null));
   const incomeSalt = bytes32ToBigInt(getOrCreateIncomeSaltForYear(epoch));
   const income = BigInt(Math.max(0, Math.floor(Number(incomeINR) || 0)));
   const pid = BigInt(policyId);
@@ -195,4 +209,52 @@ export async function buildZkIdentityBundle({
     casteCategory: casteCategory.toString(),
     domicileMH: dom.toString(),
   };
+}
+
+const WITNESS_SNAPSHOT_PREFIX = "zk_witness_";
+
+/** Persist exact witness fields at submit — required for Groth16 claim to match issued credential. */
+export function saveWitnessSnapshot(wallet, applicationYear, bundle, extra = {}) {
+  if (!wallet || !applicationYear || !bundle) return;
+  const key = `${WITNESS_SNAPSHOT_PREFIX}${String(wallet).toLowerCase()}_${applicationYear}`;
+  localStorage.setItem(
+    key,
+    JSON.stringify({
+      identitySecret: bundle.identitySecret,
+      incomeSalt: bundle.incomeSalt,
+      income: bundle.income,
+      incomeCommitment: bundle.incomeCommitment,
+      subjectId: bundle.subjectId,
+      credentialHash: bundle.credentialHash,
+      incomeCertHash: bundle.incomeCertHash,
+      casteCertHash: bundle.casteCertHash,
+      casteCategory: bundle.casteCategory,
+      domicileMH: bundle.domicileMH,
+      policyId: extra.policyId != null ? String(extra.policyId) : undefined,
+      savedAt: new Date().toISOString(),
+    })
+  );
+}
+
+export function loadWitnessSnapshot(wallet, applicationYear) {
+  try {
+    const key = `${WITNESS_SNAPSHOT_PREFIX}${String(wallet).toLowerCase()}_${applicationYear}`;
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function witnessMatchesCredentialHash(bundle, policyId) {
+  const computed = await deriveCredentialHash({
+    subjectId: bytes32ToBigInt(bundle.subjectId),
+    policyId: BigInt(policyId),
+    incomeCommitment: BigInt(bundle.incomeCommitment),
+    incomeCertHash: BigInt(bundle.incomeCertHash),
+    casteCertHash: BigInt(bundle.casteCertHash),
+    casteCategory: BigInt(bundle.casteCategory),
+    domicileMH: BigInt(bundle.domicileMH),
+  });
+  return fieldToBytes32(computed).toLowerCase() === String(bundle.credentialHash).toLowerCase();
 }

@@ -4,18 +4,4 @@ html, body, #root {
   height: 100%;
 }
 
-@media print {
-  body * {
-    visibility: hidden;
-  }
-  #zk-application-print,
-  #zk-application-print * {
-    visibility: visible;
-  }
-  #zk-application-print {
-    position: absolute;
-    left: 0;
-    top: 0;
-    width: 100%;
-  }
-}
+/* Print styles live in application-print.css (portal #zk-print-root) */

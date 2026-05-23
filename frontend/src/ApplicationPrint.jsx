@@ -1,80 +1,228 @@
-/** Printable MahaDBT-style application summary for student preview and institute review. */
+/** Printable MahaDBT-style application + print preview modal */
 
+import { useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { ONE_TIME_DOCUMENTS, oneTimeDocsFromApplication, oneTimeDocsComplete, isRenewalApplication } from "./documentsConfig.js";
+import "./application-print.css";
 
-export function ApplicationPrint({ profile, account, epoch, scheme, incomeCertCid, casteCertCid, oneTimeDocs, applicationSnapshotCid }) {
-  const p = profile || {};
-  const row = (label, value) => (
-    <div className="grid grid-cols-2 gap-x-2 border-b border-slate-100 py-1.5 text-sm">
-      <div className="font-medium text-slate-600">{label}</div>
-      <div className="text-slate-900">{value || "—"}</div>
+function Section({ title, children }) {
+  return (
+    <div className="ap-section">
+      <div className="ap-section-title">{title}</div>
+      <div className="ap-section-body">{children}</div>
     </div>
   );
+}
+
+function Row({ label, value }) {
+  return (
+    <div className="ap-row">
+      <div className="ap-label">{label}</div>
+      <div className="ap-value">{value ?? "—"}</div>
+    </div>
+  );
+}
+
+function shortCid(cid) {
+  if (!cid) return "—";
+  const s = String(cid);
+  return s.length > 20 ? `${s.slice(0, 10)}…${s.slice(-8)}` : s;
+}
+
+/** Full application form content (screen + print) */
+export function ApplicationPrintSheet({ profile, account, epoch, scheme, incomeCertCid, oneTimeDocs, applicationSnapshotCid }) {
+  const p = profile || {};
+  const ayLabel = `AY ${Number(epoch) - 1}–${epoch}`;
+  const refId = `ZK-${epoch}-${String(account || "pending").slice(2, 10).toUpperCase() || "DRAFT"}`;
+  const incomeFmt = p.familyAnnualIncome
+    ? `₹${Number(String(p.familyAnnualIncome).replace(/,/g, "")).toLocaleString("en-IN")}`
+    : "—";
+
+  const docItems = [
+    { label: "Income certificate (this year)", cid: incomeCertCid, required: true },
+    ...ONE_TIME_DOCUMENTS.map((d) => ({
+      label: d.label,
+      cid: oneTimeDocs?.[d.key]?.cid || "",
+      required: true,
+    })),
+  ];
 
   return (
-    <div id="zk-application-print" className="mt-4 rounded-xl border-2 border-slate-300 bg-white p-6 text-sm text-slate-900 print:border-0">
-      <div className="text-center text-lg font-bold">ZK‑Samvidhan — Online Application (Print)</div>
-      <div className="mt-1 text-center text-xs text-slate-600">
-        Government of Maharashtra · Academic Year {epoch} (AY {Number(epoch) - 1}-{epoch}) · {new Date().toLocaleDateString("en-IN")}
+    <div id="zk-application-print" className="ap-sheet">
+      <header className="ap-header">
+        <div className="ap-emblem" aria-hidden>
+          🛡️
+        </div>
+        <div className="ap-title-block">
+          <h1>ZK‑Samvidhan — Online Scholarship Application</h1>
+          <p className="ap-sub">Directorate-linked demo portal · Government of Maharashtra · Zero-Knowledge eligibility</p>
+        </div>
+        <div className="ap-ref">
+          <strong>{refId}</strong>
+          <span>{ayLabel}</span>
+          <span>{new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}</span>
+        </div>
+      </header>
+
+      <div className="ap-banner">
+        <strong>Scheme:</strong> {scheme?.name || "—"} · <strong>Department:</strong> {scheme?.department || "—"} ·{" "}
+        <strong>Type:</strong> {scheme?.schemeType || "—"} · <strong>Income limit:</strong>{" "}
+        {scheme?.incomeLimitINR ? `₹${scheme.incomeLimitINR.toLocaleString("en-IN")}` : "—"}
       </div>
-      <hr className="my-4" />
 
-      <div className="text-xs font-bold uppercase tracking-wide text-slate-500">Personal details</div>
-      {row("Applicant name (SSC)", p.applicantName)}
-      {row("Date of birth", p.dateOfBirth)}
-      {row("Gender", p.gender)}
-      {row("Mobile", p.mobile)}
-      {row("Email", p.email)}
-      {row("Parent / guardian mobile", p.parentMobile)}
-      {row("Aadhaar (last 4)", p.aadhaarLast4 ? `xxxx xxxx ${p.aadhaarLast4}` : "—")}
-      {row("Wallet (Citizen ID source)", account)}
+      <div className="ap-grid-2" style={{ marginBottom: 16 }}>
+        <div>
+          <Section title="Personal details">
+            <Row label="Applicant name (as per SSC)" value={p.applicantName} />
+            <Row label="Date of birth" value={p.dateOfBirth} />
+            <Row label="Gender" value={p.gender} />
+            <Row label="Mobile number" value={p.mobile} />
+            <Row label="Email" value={p.email} />
+            <Row label="Parent / guardian mobile" value={p.parentMobile} />
+            <Row label="Aadhaar (last 4 digits)" value={p.aadhaarLast4 ? `XXXX XXXX ${p.aadhaarLast4}` : "—"} />
+          </Section>
+        </div>
+        <div>
+          <div className="ap-photo-box">
+            <span>Passport size</span>
+            <span>photograph</span>
+            <span style={{ marginTop: 8, fontSize: "0.6rem" }}>(attach before institute)</span>
+          </div>
+          <Section title="Wallet / ZK identity">
+            <Row label="Connected wallet" value={account ? `${account.slice(0, 10)}…${account.slice(-8)}` : "Not connected"} />
+            <Row label="Academic year" value={ayLabel} />
+            <Row label="Policy ID (ZK)" value={scheme?.policyId != null ? String(scheme.policyId) : "—"} />
+          </Section>
+        </div>
+      </div>
 
-      <div className="mt-4 text-xs font-bold uppercase tracking-wide text-slate-500">Caste & religion</div>
-      {row("Caste category", p.casteCategory)}
-      {row("Caste", p.casteName)}
-      {row("Religion", p.religion)}
-      {row("Caste certificate no.", p.casteCertNo)}
-      {row("Issuing district", p.issuingDistrict)}
-      {row("Domicile Maharashtra", p.domicileMH !== false ? "Yes" : "No")}
+      <div className="ap-grid-2">
+        <Section title="Caste & religion">
+          <Row label="Caste category" value={p.casteCategory} />
+          <Row label="Caste / sub-caste" value={p.casteName} />
+          <Row label="Religion" value={p.religion} />
+          <Row label="Caste certificate no." value={p.casteCertNo} />
+          <Row label="Issuing district" value={p.issuingDistrict} />
+          <Row label="Domicile of Maharashtra" value={p.domicileMH !== false ? "Yes" : "No"} />
+        </Section>
+        <Section title="Income details">
+          <Row label="Family annual income" value={incomeFmt} />
+          <Row label="Income certificate no." value={p.incomeCertNo} />
+          <Row label="Income cert. issue date" value={p.incomeCertIssueDate} />
+        </Section>
+      </div>
 
-      <div className="mt-4 text-xs font-bold uppercase tracking-wide text-slate-500">Income details</div>
-      {row("Family annual income (₹)", p.familyAnnualIncome ? `₹${Number(p.familyAnnualIncome).toLocaleString("en-IN")}` : "—")}
-      {row("Income certificate no.", p.incomeCertNo)}
-      {row("Income cert. issue date", p.incomeCertIssueDate)}
+      <div className="ap-grid-2">
+        <Section title="Education (current course)">
+          <Row label="College / institute" value={p.collegeName} />
+          <Row label="Institute code" value={p.instituteCode} />
+          <Row label="Department" value={p.department} />
+          <Row label="Course" value={p.course} />
+          <Row label="Year of study" value={p.courseYear} />
+          <Row label="PRN / roll number" value={p.prn} />
+        </Section>
+        <Section title="Bank (Aadhaar-linked)">
+          <Row label="Bank account" value={p.bankAccount ? `XXXXXX${String(p.bankAccount).slice(-4)}` : "—"} />
+          <Row label="IFSC code" value={p.ifsc} />
+          <Row label="Branch name" value={p.branchName} />
+        </Section>
+      </div>
 
-      <div className="mt-4 text-xs font-bold uppercase tracking-wide text-slate-500">Education (current course)</div>
-      {row("College / institute", p.collegeName)}
-      {row("Institute code", p.instituteCode)}
-      {row("Department", p.department)}
-      {row("Course", p.course)}
-      {row("Course year", p.courseYear)}
-      {row("PRN / roll no.", p.prn)}
+      <Section title="Uploaded documents (IPFS)">
+        <div className="ap-doc-grid">
+          {docItems.map((d) => (
+            <div key={d.label} className="ap-doc-item">
+              <span className={d.cid ? "ap-doc-ok" : "ap-doc-miss"} aria-hidden>
+                {d.cid ? "✓" : "○"}
+              </span>
+              <div>
+                <div style={{ fontWeight: 600 }}>{d.label}</div>
+                <div style={{ fontSize: "0.65rem", color: "#78909c", fontFamily: "monospace" }}>{shortCid(d.cid)}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+        {applicationSnapshotCid ? (
+          <div className="ap-row" style={{ marginTop: 8 }}>
+            <div className="ap-label">Application JSON snapshot</div>
+            <div className="ap-value" style={{ fontFamily: "monospace", fontSize: "0.7rem" }}>
+              {applicationSnapshotCid}
+            </div>
+          </div>
+        ) : null}
+      </Section>
 
-      <div className="mt-4 text-xs font-bold uppercase tracking-wide text-slate-500">Bank (Aadhaar-linked)</div>
-      {row("Bank account", p.bankAccount ? `xxxxxx${String(p.bankAccount).slice(-4)}` : "—")}
-      {row("IFSC", p.ifsc)}
-      {row("Branch", p.branchName)}
-
-      <div className="mt-4 text-xs font-bold uppercase tracking-wide text-slate-500">Scheme applied</div>
-      {row("Scheme name", scheme?.name)}
-      {row("Department (scheme)", scheme?.department)}
-      {row("Scheme type", scheme?.schemeType)}
-      {row("Policy ID (ZK)", scheme?.policyId)}
-
-      <div className="mt-4 text-xs font-bold uppercase tracking-wide text-slate-500">Documents (IPFS / Pinata)</div>
-      {row("Income certificate (this year)", incomeCertCid)}
-      {row("Caste certificate (one-time)", casteCertCid || oneTimeDocs?.casteCert?.cid)}
-      {row("Ration card (one-time)", oneTimeDocs?.rationCard?.cid)}
-      {row("Domicile certificate (one-time)", oneTimeDocs?.domicileCert?.cid)}
-      {row("CAP ID certificate (one-time)", oneTimeDocs?.capIdCert?.cid)}
-      {row("Admission letter (one-time)", oneTimeDocs?.admissionLetter?.cid)}
-      {row("Application snapshot CID", applicationSnapshotCid)}
-
-      <p className="mt-6 text-xs text-slate-600">
-        I declare that the above information matches my MahaDBT profile. The institute will verify documents on IPFS before issuing the on-chain eligibility credential.
-      </p>
+      <div className="ap-footer">
+        <p>
+          I declare that the information above is true and matches my records. The institute will verify documents on IPFS before
+          issuing the on-chain eligibility credential. This printout is for student records and institute review — not a final
+          sanction order.
+        </p>
+        <div className="ap-sign-row">
+          <div className="ap-sign-line">Signature of applicant</div>
+          <div className="ap-sign-line">Date & place</div>
+        </div>
+        <p style={{ marginTop: 16, textAlign: "center", fontSize: "0.65rem" }}>
+          ZK‑Samvidhan · MST Testnet · Generated {new Date().toLocaleString("en-IN")}
+        </p>
+      </div>
     </div>
   );
+}
+
+/** Modal + portal — fixes blank print (renders before window.print) */
+export function PrintPreviewModal({ open, onClose, children }) {
+  const runPrint = useCallback(() => {
+    document.body.classList.add("zk-print-mode");
+    requestAnimationFrame(() => {
+      window.print();
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKey = (e) => {
+      if (e.key === "Escape") onClose?.();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  useEffect(() => {
+    const afterPrint = () => {
+      document.body.classList.remove("zk-print-mode");
+    };
+    window.addEventListener("afterprint", afterPrint);
+    return () => window.removeEventListener("afterprint", afterPrint);
+  }, []);
+
+  if (!open) return null;
+
+  return createPortal(
+    <div id="zk-print-root" className="zk-print-overlay">
+      <div className="zk-print-toolbar">
+        <div>
+          <div className="font-semibold text-slate-900">Application print preview</div>
+          <div className="text-xs text-slate-600">Review your data below, then print or save as PDF.</div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" className="md-btn md-btn-secondary md-btn-md" onClick={onClose}>
+            Close
+          </button>
+          <button type="button" className="md-btn md-btn-primary md-btn-md" onClick={runPrint}>
+            Print / Save PDF
+          </button>
+        </div>
+      </div>
+      <div className="zk-print-scroll">{children}</div>
+    </div>,
+    document.body
+  );
+}
+
+/** @deprecated use ApplicationPrintSheet inside PrintPreviewModal */
+export function ApplicationPrint(props) {
+  return <ApplicationPrintSheet {...props} />;
 }
 
 function VerifiedBadge() {

@@ -26,15 +26,12 @@ export function ZkArchitecturePanel({ compact = false }) {
       step: "3",
       title: "ZK proof at renewal / claim (Groth16)",
       color: "violet",
-      body: "Wallet/browser proves: “I hold a valid issuer credential where conditions match” — without sending PDFs, Aadhaar, or exact income again.",
+      body: "At claim: Groth16 proves eligibility. Income can change every year (new cert + issuer) — that is normal. Caste, domicile, CAP, admission are proved by ZK from the first credential — no PDF re-upload.",
       items: [
-        "Proves: same student (identity secret → subjectId)",
-        "Proves: institute-issued credential (Merkle membership)",
-        "Proves: eligible caste category for policy (private)",
-        "Proves: Maharashtra domicile (private)",
-        "Proves: income ≤ scheme limit (private amount; public commitment)",
-        "Proves: one-time doc hashes still match credential (private — not IPFS links)",
-        "Public on-chain: subjectId, credentialHash, nullifier, policy, epoch, incomeCommitment, merkleRoot",
+        "Same student (identity secret → subjectId)",
+        "Issuer credential still valid (Merkle leaf)",
+        "ZK-only once: caste category + domicile + caste/admission/CAP doc hashes match credential",
+        "Each year: income ≤ limit (private ₹; public incomeCommitment after issuer verified new cert)",
       ],
     },
   ];
@@ -42,7 +39,7 @@ export function ZkArchitecturePanel({ compact = false }) {
   if (compact) {
     return (
       <div className="rounded-xl border border-violet-200 bg-violet-50/60 p-3 text-xs text-slate-800">
-        <strong className="text-violet-900">Credential + ZK:</strong> PDFs → issuer verifies → on-chain hash credential → yearly Groth16 claim without re-uploading documents.
+        <strong className="text-violet-900">Split policy:</strong> Income PDF re-shown yearly (OK). Caste, domicile, CAP, admission proved by ZK only after first verification.
       </div>
     );
   }
@@ -94,54 +91,108 @@ export function ZkArchitecturePanel({ compact = false }) {
         <br />
         {"}"}
       </div>
-      <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-3 py-2 text-xs text-slate-700">
-        <strong>Real-world ZKP pattern (this project):</strong> (1) first-time document verification → (2) credential issuance → (3) blockchain anchor → (4) ZK renewal/reuse.
-        Annual renewal: institute re-checks <strong>new income PDF only</strong>; student ZK-claims without re-uploading caste/ration/domicile/CAP/admission.
-      </div>
+      <ZkSplitPolicyTable />
+    </div>
+  );
+}
+
+/** What we re-verify vs what ZK proves alone (viva-friendly). */
+export function ZkSplitPolicyTable() {
+  return (
+    <div className="overflow-hidden rounded-xl border border-slate-200 text-xs">
+      <table className="w-full border-collapse text-left">
+        <thead>
+          <tr className="bg-slate-100 text-slate-700">
+            <th className="border-b border-slate-200 px-3 py-2 font-semibold">Attribute / document</th>
+            <th className="border-b border-slate-200 px-3 py-2 font-semibold">Each year</th>
+            <th className="border-b border-slate-200 px-3 py-2 font-semibold">How</th>
+          </tr>
+        </thead>
+        <tbody className="text-slate-800">
+          <tr className="bg-amber-50/80">
+            <td className="border-b border-slate-100 px-3 py-2">Income certificate + amount</td>
+            <td className="border-b border-slate-100 px-3 py-2">Re-submit PDF → issuer checks</td>
+            <td className="border-b border-slate-100 px-3 py-2">Normal verification (income changes)</td>
+          </tr>
+          <tr>
+            <td className="border-b border-slate-100 px-3 py-2">Caste certificate validity</td>
+            <td className="border-b border-slate-100 px-3 py-2">No re-upload</td>
+            <td className="border-b border-slate-100 px-3 py-2 font-medium text-violet-900">ZK: hash + category in credential</td>
+          </tr>
+          <tr>
+            <td className="border-b border-slate-100 px-3 py-2">Domicile / Maharashtra residence</td>
+            <td className="border-b border-slate-100 px-3 py-2">No re-upload</td>
+            <td className="border-b border-slate-100 px-3 py-2 font-medium text-violet-900">ZK: domicile flag in credential</td>
+          </tr>
+          <tr>
+            <td className="border-b border-slate-100 px-3 py-2">CAP ID / admission letter / ration card</td>
+            <td className="border-b border-slate-100 px-3 py-2">No re-upload</td>
+            <td className="border-b border-slate-100 px-3 py-2 font-medium text-violet-900">ZK: doc hashes bound at first admission</td>
+          </tr>
+          <tr className="bg-blue-50/50">
+            <td className="px-3 py-2">Same student + anti double-claim</td>
+            <td className="px-3 py-2">Per academic year</td>
+            <td className="px-3 py-2">ZK nullifier + on-chain registry</td>
+          </tr>
+        </tbody>
+      </table>
+      <p className="border-t border-slate-200 bg-emerald-50/80 px-3 py-2 text-slate-700">
+        <strong>Best use of ZK here:</strong> prove admission/caste/domicile validity from the institute-issued credential — not re-exposing those documents every year. Income is the one field that legitimately needs a fresh document.
+      </p>
     </div>
   );
 }
 
 /** What the circom circuit checks (for claim step). */
 export function ZkClaimProofChecklist() {
-  const privateWitness = [
-    "Income amount (₹)",
-    "Income salt (per academic year)",
-    "Identity secret",
-    "Caste category code",
-    "Domicile flag",
-    "Income cert hash (CID → field)",
-    "Caste cert hash (CID → field)",
-    "Merkle path to your credential leaf",
+  const yearlyNormal = [
+    "New income certificate PDF → issuer verifies (portal)",
+    "New incomeCommitment on-chain after re-issue",
+    "Income ≤ scheme limit (private ₹ in witness)",
+  ];
+  const zkOncePrivate = [
+    "Caste category still eligible for policy",
+    "Domicile Maharashtra (unchanged)",
+    "Caste / CAP / admission / ration hashes match first-admission credential",
+    "Same identity secret → subjectId",
+    "Merkle proof: credential issued by institute",
   ];
   const publicOnChain = [
     "subjectId",
     "credentialHash",
     "nullifierHash (one claim per year)",
     "policyId",
-    "epoch (academic year)",
-    "incomeCommitment (hide exact income)",
+    "epoch",
+    "incomeCommitment",
     "merkleRoot",
   ];
 
   return (
-    <div className="mt-3 grid gap-3 md:grid-cols-2">
-      <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-        <div className="text-xs font-bold uppercase text-slate-500">Stays private (witness)</div>
+    <div className="mt-3 grid gap-3 md:grid-cols-3">
+      <div className="rounded-xl border border-amber-200 bg-amber-50/50 p-3">
+        <div className="text-xs font-bold uppercase text-amber-900">Re-checked each year (not ZK magic)</div>
         <ul className="mt-2 space-y-1 text-xs text-slate-700">
-          {privateWitness.map((x) => (
+          {yearlyNormal.map((x) => (
+            <li key={x}>• {x}</li>
+          ))}
+        </ul>
+      </div>
+      <div className="rounded-xl border border-violet-200 bg-violet-50/50 p-3">
+        <div className="text-xs font-bold uppercase text-violet-900">Proved by ZK only (no doc re-upload)</div>
+        <ul className="mt-2 space-y-1 text-xs text-slate-700">
+          {zkOncePrivate.map((x) => (
             <li key={x}>• {x}</li>
           ))}
         </ul>
       </div>
       <div className="rounded-xl border border-blue-200 bg-blue-50/50 p-3">
-        <div className="text-xs font-bold uppercase text-blue-800">Published with proof (public)</div>
+        <div className="text-xs font-bold uppercase text-blue-800">On-chain with proof</div>
         <ul className="mt-2 space-y-1 text-xs text-slate-700">
           {publicOnChain.map((x) => (
             <li key={x}>• {x}</li>
           ))}
         </ul>
-        <p className="mt-2 text-xs text-slate-600">No PDF, no IPFS link, no wallet address in the proof inputs.</p>
+        <p className="mt-2 text-xs text-slate-600">No PDF/CAP/caste file links in the transaction.</p>
       </div>
     </div>
   );

@@ -10,7 +10,8 @@ import {
   validateProfileForApply,
 } from "./mahadbtSchemes.js";
 import { pinFileToIpfs, pinJsonToIpfs } from "./pinataUpload.js";
-import { ApplicationPrint, ApplicationDetailPanel, IssuerDocumentReview } from "./ApplicationPrint.jsx";
+import { ApplicationPrintSheet, PrintPreviewModal, ApplicationDetailPanel, IssuerDocumentReview } from "./ApplicationPrint.jsx";
+import { LandingPage } from "./components/LandingPage.jsx";
 import { DocumentUploadField } from "./DocumentUploadField.jsx";
 import { OneTimeDocsUpload } from "./OneTimeDocsUpload.jsx";
 import {
@@ -27,8 +28,15 @@ import {
   bytes32ToBigInt,
   saveFirstAdmissionBaseline,
   loadFirstAdmissionBaseline,
+  deriveNullifierHash,
+  fieldToBytes32,
+  getOrCreateIdentitySecret,
+  saveWitnessSnapshot,
+  loadWitnessSnapshot,
+  witnessMatchesCredentialHash,
 } from "./zkCrypto.js";
-import { ZkArchitecturePanel, ZkClaimProofChecklist } from "./ZkArchitecturePanel.jsx";
+import { ZkArchitecturePanel } from "./ZkArchitecturePanel.jsx";
+import { ClaimStatusCard } from "./components/ClaimStatusCard.jsx";
 import {
   appendLeafPoseidon,
   syncMerkleFromServer,
@@ -110,11 +118,32 @@ const SCHOLARSHIP_PROGRAMS = [
   },
 ];
 
-/** Academic years for annual renewal claims (one on-chain claim per year). */
-const ACADEMIC_YEARS = [2026, 2027, 2028, 2029];
+const ZERO_HASH32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 function defaultAcademicYear() {
   return String(new Date().getFullYear());
+}
+
+/** Years shown in dropdown / claim chips — derived from issue year + claim state. */
+function computeSelectableAcademicYears({ hasIssuedCredential, firstIssueYear, needsFirstClaim }) {
+  const now = Number(defaultAcademicYear());
+  if (!hasIssuedCredential) return [now];
+  const issueY = firstIssueYear || now;
+  if (needsFirstClaim) return [issueY];
+  const maxY = Math.min(issueY + 1, now + 1);
+  const years = [];
+  for (let y = issueY; y <= maxY; y += 1) years.push(y);
+  return years.length ? years : [issueY];
+}
+
+function pickPrimaryIssuedApp(apps) {
+  if (!apps?.length) return null;
+  return (
+    apps.find((a) => a.status === "issued" && a.applicationType !== "annual_renewal") ||
+    apps.find((a) => a.status === "issued") ||
+    apps.find((a) => a.credentialHash && a.subjectId) ||
+    null
+  );
 }
 
 function ipfsGatewayUrl(cid) {
@@ -345,7 +374,7 @@ async function decryptFileAesGcm(blob, passphrase) {
 
 function Card({ title, subtitle, children }) {
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+    <div className="md-card p-5 md:p-6">
       <div className="mb-4">
         <div className="text-lg font-semibold text-slate-900">{title}</div>
         {subtitle ? <div className="mt-1 text-sm text-slate-600">{subtitle}</div> : null}
@@ -365,25 +394,18 @@ function Field({ label, children }) {
 }
 
 function Input(props) {
-  return (
-    <input
-      {...props}
-      className={`w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 ${props.className || ""}`}
-    />
-  );
+  return <input {...props} className={`md-input ${props.className || ""}`} />;
 }
 
-function Button({ variant = "primary", ...props }) {
+function Button({ variant = "primary", size = "md", ...props }) {
   const cls =
     variant === "secondary"
-      ? "border border-slate-200 bg-white hover:bg-slate-50 text-slate-900"
-      : "bg-blue-600 hover:bg-blue-700 text-white";
-  return (
-    <button
-      {...props}
-      className={`inline-flex items-center justify-center rounded-xl px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${cls} ${props.className || ""}`}
-    />
-  );
+      ? "md-btn md-btn-secondary"
+      : variant === "danger"
+        ? "md-btn md-btn-md bg-red-700 text-white hover:bg-red-800 shadow-sm"
+        : "md-btn md-btn-primary";
+  const sz = size === "lg" ? "md-btn-lg" : "md-btn-md";
+  return <button {...props} className={`${cls} ${sz} ${props.className || ""}`} />;
 }
 
 function TabButton({ active, children, ...props }) {
@@ -579,13 +601,36 @@ export default function App() {
     [applications]
   );
 
-  const baseIssuedApplication = useMemo(
+  const baseIssuedApplication = useMemo(() => pickPrimaryIssuedApp(myApplications), [myApplications]);
+
+  const firstIssueYear = useMemo(() => {
+    const y = baseIssuedApplication?.applicationYear;
+    return y ? Number(y) : null;
+  }, [baseIssuedApplication]);
+
+  const needsFirstClaim = useMemo(() => {
+    if (!hasIssuedCredential || !firstIssueYear) return false;
+    return !claimedEpochs[firstIssueYear];
+  }, [hasIssuedCredential, firstIssueYear, claimedEpochs]);
+
+  const showRenewalUI = useMemo(() => hasIssuedCredential && !needsFirstClaim, [hasIssuedCredential, needsFirstClaim]);
+
+  const selectableAcademicYears = useMemo(
     () =>
-      myApplications.find((a) => a.status === "issued" && a.applicationType !== "annual_renewal") ||
-      myApplications.find((a) => a.status === "issued") ||
-      null,
-    [myApplications]
+      computeSelectableAcademicYears({
+        hasIssuedCredential,
+        firstIssueYear,
+        needsFirstClaim,
+      }),
+    [hasIssuedCredential, firstIssueYear, needsFirstClaim]
   );
+
+  useEffect(() => {
+    if (!hasIssuedCredential || !selectableAcademicYears.length) return;
+    if (!selectableAcademicYears.map(String).includes(String(epoch))) {
+      setEpoch(String(selectableAcademicYears[0]));
+    }
+  }, [hasIssuedCredential, selectableAcademicYears, epoch]);
 
   const renewalPendingForYear = useMemo(
     () =>
@@ -603,12 +648,26 @@ export default function App() {
     [myApplications, epoch]
   );
 
+  const issuedAppForEpoch = useMemo(() => {
+    const renewal = myApplications.find(
+      (a) => a.applicationType === "annual_renewal" && String(a.applicationYear) === String(epoch) && a.status === "issued"
+    );
+    if (renewal) return renewal;
+    const any = myApplications.find((a) => a.status === "issued" && String(a.applicationYear) === String(epoch));
+    if (any) return any;
+    if (baseIssuedApplication?.status === "issued" && String(baseIssuedApplication.applicationYear) === String(epoch)) {
+      return baseIssuedApplication;
+    }
+    return myApplications.find((a) => a.status === "issued") || null;
+  }, [myApplications, epoch, baseIssuedApplication]);
+
   const canClaimForYear = useMemo(() => {
-    if (!hasIssuedCredential) return false;
-    if (renewalIssuedForYear) return true;
-    if (String(baseIssuedApplication?.applicationYear) === String(epoch) && baseIssuedApplication?.status === "issued") return true;
-    return false;
-  }, [hasIssuedCredential, renewalIssuedForYear, baseIssuedApplication, epoch]);
+    if (!account || !hasIssuedCredential) return false;
+    if (claimedEpochs[Number(epoch)]) return false;
+    return true;
+  }, [account, hasIssuedCredential, claimedEpochs, epoch]);
+
+  const alreadyClaimedEpoch = Boolean(claimedEpochs[Number(epoch)]);
 
   const selectedApplication = useMemo(
     () => pendingApplications.find((a) => a.id === selectedAppId) || null,
@@ -640,40 +699,30 @@ export default function App() {
         fetchApplications().catch(() => {});
       }
       if (role === "citizen") {
-        fetchMyApplications().catch(() => {});
+        await fetchMyApplications();
       }
 
-      // Load credential state (ZK Citizen ID, not wallet hash).
+      // Load credential state — wallet issued app + on-chain registry.
       try {
         await assertChainConfig(ethers, readProvider);
-        const gateProbe = gateContract(ethers, readProvider);
 
-        let sid = subjectId;
         if (role === "citizen") {
-          sid = await deriveSubjectIdFromConnectedWallet(addr);
+          const synced = await syncCredentialFromWalletApps(addr, readProvider);
+          if (synced.has && isBytes32Hex(synced.subjectId)) {
+            await refreshClaimedEpochs(synced.subjectId).catch(() => {});
+          }
         } else {
-          sid = isBytes32Hex(subjectId)
+          let sid = isBytes32Hex(subjectId)
             ? subjectId
             : fieldReduceBytes32(ethers.keccak256(ethers.solidityPacked(["address"], [addr])));
-        }
-
-        const stored = await registry.credentialHashBySubject(sid);
-        const has = stored && stored !== "0x0000000000000000000000000000000000000000000000000000000000000000";
-        setHasIssuedCredential(Boolean(has));
-        if (has) setCredentialHash(stored);
-        setSubjectId(sid);
-
-        if (role === "citizen") {
-          const pid = BigInt(policyId || "0");
-          const out = {};
-          for (const y of ACADEMIC_YEARS) {
-            out[y] = await gateProbe.claimed(sid, pid, BigInt(y));
-          }
-          setClaimedEpochs(out);
+          const stored = await registry.credentialHashBySubject(sid);
+          const has = stored && stored !== ZERO_HASH32;
+          setHasIssuedCredential(Boolean(has));
+          if (has) setCredentialHash(stored);
+          setSubjectId(sid);
         }
       } catch (credErr) {
-        setHasIssuedCredential(false);
-        console.warn("credential/claimed load:", credErr);
+        console.warn("credential load:", credErr);
         if (String(credErr?.message || credErr).includes("misconfigured") || String(credErr?.message || credErr).includes("mismatch")) {
           setError(String(credErr?.message || credErr));
         }
@@ -690,31 +739,39 @@ export default function App() {
   }
 
   const selectedProgram = useMemo(() => SCHOLARSHIP_PROGRAMS.find((p) => p.key === programKey) || SCHOLARSHIP_PROGRAMS[0], [programKey]);
-  const citizenSteps = useMemo(
-    () =>
-      hasIssuedCredential
-        ? ["Connect wallet", "Academic year", "Renewal", "Citizen ID", "ZK claim", "Status"]
-        : [
-            "Connect wallet",
-            "Academic year",
-            "Profile",
-            "Eligible schemes",
-            "Apply & print",
-            "Citizen ID",
-            "ZK claim",
-            "Status",
-          ],
-    [hasIssuedCredential]
-  );
+  const citizenSteps = useMemo(() => {
+    if (needsFirstClaim) {
+      return ["Connect wallet", "Academic year", "ZK claim", "Status"];
+    }
+    if (showRenewalUI) {
+      return ["Connect wallet", "Academic year", "Renewal", "Citizen ID", "ZK claim", "Status"];
+    }
+    return [
+      "Connect wallet",
+      "Academic year",
+      "Profile",
+      "Eligible schemes",
+      "Apply & print",
+      "Citizen ID",
+      "ZK claim",
+      "Status",
+    ];
+  }, [needsFirstClaim, showRenewalUI]);
 
   const citizenStepperIndex = useMemo(() => {
+    if (needsFirstClaim) {
+      if (citizenStep <= 1) return citizenStep;
+      if (citizenStep === 6) return 2;
+      if (citizenStep === 7) return 3;
+      return 0;
+    }
     if (!hasIssuedCredential) return citizenStep;
     if (citizenStep <= 1) return citizenStep;
     if (citizenStep === 5) return 2;
     if (citizenStep === 6) return 3;
     if (citizenStep === 7) return 4;
     return 0;
-  }, [citizenStep, hasIssuedCredential]);
+  }, [citizenStep, hasIssuedCredential, needsFirstClaim]);
 
   const eligibleSchemes = useMemo(() => filterEligibleSchemes(studentProfile), [studentProfile]);
 
@@ -739,6 +796,13 @@ export default function App() {
         setBackendPersistence("unreachable");
       });
   }, []);
+
+  useEffect(() => {
+    if (role !== "citizen" || citizenStep !== 6 || !account) return;
+    fetchMyApplications()
+      .then(() => refreshCitizenCredentialState())
+      .catch(() => refreshCitizenCredentialState().catch(() => {}));
+  }, [role, citizenStep, account, epoch, myApplications.length]);
 
   const issuerSteps = useMemo(() => ["Pending applications", "Review certificate", "Issue credential", "Done"], []);
 
@@ -798,34 +862,149 @@ export default function App() {
     return first;
   }
 
-  async function buildZkBundleForClaim(epochOverride) {
-    const ep = epochOverride ?? epoch;
-    const issuedApp = getActiveIssuedAppForEpoch(ep) || selectedApplication || baseIssuedApplication;
+  async function syncCredentialFromWalletApps(walletAddr, readProvider) {
+    const addr = walletAddr || account;
+    if (!addr) return { has: false };
+    const registry = registryContract(ethers, readProvider || new ethers.JsonRpcProvider(MST_RPC_URL));
+    let apps = myApplications;
+    if (!apps.length) {
+      try {
+        const data = await fetchJson(`${PINATA_PROXY_URL}/applications?citizenAddress=${addr}`);
+        apps = data.applications || [];
+        setMyApplications(apps);
+      } catch {
+        apps = [];
+      }
+    }
+    const issuedApp = pickPrimaryIssuedApp(apps);
+    const renewalForEpoch = apps.find(
+      (a) => a.applicationType === "annual_renewal" && String(a.applicationYear) === String(epoch) && a.status === "issued"
+    );
+    const activeApp = renewalForEpoch || issuedApp;
+
+    let sid = activeApp?.subjectId || issuedApp?.subjectId;
+    if (!isBytes32Hex(sid)) {
+      const prof = activeApp?.applicantProfile || issuedApp?.applicantProfile || studentProfile;
+      const ot = oneTimeDocsFromApplication(activeApp || issuedApp);
+      const credYear = activeApp?.applicationYear || issuedApp?.applicationYear || epoch;
+      const pre = await buildZkIdentityBundle({
+        incomeINR: prof?.familyAnnualIncome || proofIncome,
+        policyId: activeApp?.policyId || issuedApp?.policyId || policyId,
+        epoch: credYear,
+        incomeCertCid: activeApp?.incomeCertCid || issuedApp?.incomeCertCid || incomeCertCid || "",
+        casteCertCid: ot.casteCert?.cid || "",
+        caste: prof?.casteCategory || "OPEN",
+        domicileMH: prof?.domicileMH !== false,
+        walletAddress: addr,
+      });
+      sid = pre.subjectId;
+    }
+
+    let hash = ZERO_HASH32;
+    if (isBytes32Hex(sid)) {
+      hash = await registry.credentialHashBySubject(sid);
+    }
+    if (!hash || hash === ZERO_HASH32) {
+      const candidate = activeApp?.credentialHash || issuedApp?.credentialHash;
+      if (candidate && isBytes32Hex(candidate)) {
+        try {
+          if (await registry.issuedLeaf(candidate)) hash = candidate;
+        } catch {
+          hash = candidate;
+        }
+      }
+    }
+
+    const has = Boolean(hash && hash !== ZERO_HASH32);
+    setHasIssuedCredential(has);
+    if (isBytes32Hex(sid)) setSubjectId(sid);
+    if (has) setCredentialHash(hash);
+    const pol = activeApp?.policyId || issuedApp?.policyId;
+    if (pol) setPolicyId(String(pol));
+    const inc = activeApp?.incomeCommitment || issuedApp?.incomeCommitment;
+    if (inc) setIncomeCommitmentHex(String(inc));
+
+    return { has, subjectId: sid, credentialHash: hash, issuedApp: activeApp || issuedApp };
+  }
+
+  async function buildZkBundleForClaim(claimEpochOverride) {
+    const claimEp = String(claimEpochOverride ?? epoch);
+    const readProvider = new ethers.JsonRpcProvider(MST_RPC_URL);
+    const registry = registryContract(ethers, readProvider);
+
+    const issuedApp =
+      getActiveIssuedAppForEpoch(claimEp) ||
+      pickPrimaryIssuedApp(myApplications) ||
+      baseIssuedApplication;
+
     const ot = oneTimeDocsFromApplication(issuedApp);
     const baseline = loadFirstAdmissionBaseline();
+    const prof = issuedApp?.applicantProfile || studentProfile;
+    const credYear = String(issuedApp?.applicationYear || claimEp);
     const certCid =
-      (String(ep) === String(epoch) && renewalIncomeCid) ||
       issuedApp?.incomeCertCid ||
+      issuedApp?.encryptedDocCid ||
+      (String(claimEp) === String(epoch) && renewalIncomeCid) ||
       incomeCertCid ||
       studentDocCid ||
       encryptedDocCid ||
       "";
     const casteCid = ot.casteCert?.cid || issuedApp?.casteCertCid || baseline?.casteCertCid || "";
-    const prof = issuedApp?.applicantProfile || studentProfile;
-    const incomeVal = prof?.familyAnnualIncome || proofIncome;
-    const bundle = await buildZkIdentityBundle({
-      incomeINR: incomeVal,
-      policyId: issuedApp?.policyId || selectedApplication?.policyId || policyId,
-      epoch: ep,
-      incomeCertCid: certCid,
-      casteCertCid: casteCid,
-      caste: prof?.casteCategory || baseline?.caste || studentProfile?.casteCategory || "OPEN",
-      domicileMH: (prof?.domicileMH ?? baseline?.domicileMH ?? studentProfile?.domicileMH) !== false,
-    });
+    const pid = issuedApp?.policyId || policyId;
+
+    const snap = account ? loadWitnessSnapshot(account, credYear) : null;
+    const expectedHash = issuedApp?.credentialHash;
+    let bundle;
+
+    if (
+      snap &&
+      expectedHash &&
+      isBytes32Hex(expectedHash) &&
+      String(snap.credentialHash).toLowerCase() === expectedHash.toLowerCase()
+    ) {
+      const nh = await deriveNullifierHash(BigInt(snap.identitySecret), BigInt(pid || "0"), BigInt(claimEp));
+      bundle = {
+        ...snap,
+        nullifierHash: fieldToBytes32(nh),
+      };
+    } else {
+      bundle = await buildZkIdentityBundle({
+        incomeINR: prof?.familyAnnualIncome || proofIncome,
+        policyId: pid,
+        epoch: credYear,
+        incomeCertCid: certCid,
+        casteCertCid: casteCid,
+        caste: prof?.casteCategory || baseline?.caste || studentProfile?.casteCategory || "OPEN",
+        domicileMH: (prof?.domicileMH ?? baseline?.domicileMH ?? studentProfile?.domicileMH) !== false,
+        walletAddress: account,
+      });
+    }
+
+    const witnessOk = await witnessMatchesCredentialHash(bundle, pid);
+    if (!witnessOk) {
+      throw new Error(
+        "Cannot build ZK proof: local secrets do not match your issued credential. Use the same browser and wallet where you submitted the application."
+      );
+    }
+
+    if (isBytes32Hex(bundle.subjectId)) {
+      const chainHash = await registry.credentialHashBySubject(bundle.subjectId);
+      if (chainHash && chainHash !== ZERO_HASH32 && chainHash.toLowerCase() !== bundle.credentialHash.toLowerCase()) {
+        throw new Error(
+          "On-chain credential hash does not match your application witness. Ask the institute to re-issue, or use the original application browser."
+        );
+      }
+    }
+
+    const nh = await deriveNullifierHash(BigInt(bundle.identitySecret), BigInt(pid || "0"), BigInt(claimEp));
+    bundle.nullifierHash = fieldToBytes32(nh);
+
     setSubjectId(bundle.subjectId);
     setCredentialHash(bundle.credentialHash);
     setNullifierHash(bundle.nullifierHash);
     setIncomeCommitmentHex(bundle.incomeCommitment);
+    if (pid) setPolicyId(String(pid));
+
     return bundle;
   }
 
@@ -859,20 +1038,25 @@ export default function App() {
     return bundle.credentialHash;
   }
 
-  async function refreshClaimedEpochs() {
-    if (!isBytes32Hex(subjectId)) return {};
+  async function refreshClaimedEpochs(sidOverride) {
+    const sid = sidOverride || subjectId;
+    if (!isBytes32Hex(sid)) return {};
     const readProvider = new ethers.JsonRpcProvider(MST_RPC_URL);
     const gate = gateContract(ethers, readProvider);
     const pid = BigInt(policyId || "0");
+    const years =
+      selectableAcademicYears.length > 0
+        ? selectableAcademicYears
+        : computeSelectableAcademicYears({ hasIssuedCredential, firstIssueYear, needsFirstClaim });
     const out = {};
-    for (const y of ACADEMIC_YEARS) {
+    for (const y of years) {
       try {
-        out[y] = await gate.claimed(subjectId, pid, BigInt(y));
+        out[y] = await gate.claimed(sid, pid, BigInt(y));
       } catch {
         out[y] = false;
       }
     }
-    setClaimedEpochs(out);
+    setClaimedEpochs((prev) => ({ ...prev, ...out }));
     return out;
   }
 
@@ -908,20 +1092,32 @@ export default function App() {
     setIncomeCertPreviewUrl(ipfsGatewayUrl(cid));
   }
 
+  async function refreshCitizenCredentialState() {
+    if (!account) return { has: false };
+    const readProvider = new ethers.JsonRpcProvider(MST_RPC_URL);
+    const synced = await syncCredentialFromWalletApps(account, readProvider);
+    try {
+      const bundle = await buildZkBundleForClaim(epoch);
+      setNullifierHash(bundle.nullifierHash);
+      setIncomeCommitmentHex(bundle.incomeCommitment);
+      const app = synced.issuedApp;
+      if (app?.applicationYear && app?.credentialHash) {
+        saveWitnessSnapshot(account, app.applicationYear, bundle, { policyId: app.policyId });
+      }
+    } catch {
+      /* witness may be unavailable until same browser — sync still returns chain state */
+    }
+    await refreshClaimedEpochs(synced.subjectId).catch(() => {});
+    return synced;
+  }
+
   async function checkIfCredentialExistsForConnectedWallet() {
     if (!account) throw new Error("Connect wallet first.");
-    const sid = await deriveSubjectIdFromConnectedWallet();
-    const provider = new ethers.JsonRpcProvider(MST_RPC_URL);
-    const registry = registryContract(ethers, provider);
-    const stored = await registry.credentialHashBySubject(sid);
-    const has = stored && stored !== "0x0000000000000000000000000000000000000000000000000000000000000000";
-    setHasIssuedCredential(Boolean(has));
-    if (has) {
-      setCredentialHash(stored);
-      setCitizenStep(5);
+    const synced = await refreshCitizenCredentialState();
+    if (synced.has) {
+      setCitizenStep(needsFirstClaim ? 6 : 5);
     }
-    await refreshClaimedEpochs().catch(() => {});
-    return { subjectId: sid, has, stored };
+    return synced;
   }
 
   function applyToScheme(scheme) {
@@ -979,6 +1175,7 @@ export default function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    saveWitnessSnapshot(account, epoch, bundle, { policyId: baseIssuedApplication.policyId });
     setToast({
       tone: "success",
       title: "Annual income submitted",
@@ -987,9 +1184,19 @@ export default function App() {
     await fetchMyApplications();
   }
 
-  function printApplicationPreview() {
+  function openPrintPreview() {
+    const miss = validateProfileForApply(studentProfile);
+    if (miss.length) {
+      setError(`Complete profile (Step 3) before print: ${miss.join(", ")}`);
+      setCitizenStep(2);
+      return;
+    }
+    if (!selectedMahadbtScheme) {
+      setError("Select a scheme in Step 4 before printing.");
+      setCitizenStep(3);
+      return;
+    }
     setShowPrintPreview(true);
-    window.setTimeout(() => window.print(), 300);
   }
 
   async function setIssuer() {
@@ -1036,6 +1243,7 @@ export default function App() {
       casteCertCid: ot.casteCert?.cid || app.casteCertCid,
       caste: prof.casteCategory || "OPEN",
       domicileMH: prof.domicileMH !== false,
+      walletAddress: app.citizenAddress || account,
     });
     setSubjectId(bundle.subjectId);
     setCredentialHash(bundle.credentialHash);
@@ -1176,63 +1384,73 @@ export default function App() {
 
   async function generateProofAndClaim() {
     setError("");
-    setStatus("Checking on-chain credential + nullifier…");
-    setToast({ tone: "loading", title: "Preparing claim", message: "Checking credential + nullifier on-chain..." });
+    setStatus("Syncing credential from wallet + chain…");
+    setToast({ tone: "loading", title: "Preparing claim", message: "Loading your issued credential…" });
 
     const readProvider = new ethers.JsonRpcProvider(MST_RPC_URL);
     const registryRead = registryContract(ethers, readProvider);
-    if (!isBytes32Hex(subjectId) || !isBytes32Hex(credentialHash) || !isBytes32Hex(nullifierHash)) {
-      throw new Error("subjectId / credentialHash / nullifierHash must be valid bytes32 hex (0x + 64 hex chars).");
+
+    await syncCredentialFromWalletApps(account, readProvider).catch(() => {});
+    const bundle = await buildZkBundleForClaim(epoch);
+    const sid = bundle.subjectId;
+    const credHash = bundle.credentialHash;
+    const nullifier = bundle.nullifierHash;
+    const claimPolicyId = issuedAppForEpoch?.policyId || policyId;
+
+    setSubjectId(sid);
+    setCredentialHash(credHash);
+    setNullifierHash(nullifier);
+
+    if (!isBytes32Hex(sid) || !isBytes32Hex(credHash) || !isBytes32Hex(nullifier)) {
+      throw new Error("Could not load credential for this wallet. Connect the wallet used at application time.");
     }
-    const stored = await registryRead.credentialHashBySubject(subjectId);
-    if (stored === "0x0000000000000000000000000000000000000000000000000000000000000000") {
+
+    const stored = await registryRead.credentialHashBySubject(sid);
+    if (!stored || stored === ZERO_HASH32) {
       setCitizenStep(7);
       throw new Error(
-        "Scholarship credential NOT issued for your Citizen ID yet.\n\nFix: submit your application (Citizen Step 2), wait for institute issuance, then return here.\n\nIssuer: select the pending application → Issue credential."
+        "Credential not issued on-chain yet. Wait for the institute to issue after reviewing your application."
       );
     }
-    if (stored.toLowerCase() !== credentialHash.toLowerCase()) {
-      setCredentialHash(stored);
-      setToast({
-        tone: "error",
-        title: "Credential hash mismatch",
-        message: "Auto-loaded the on-chain credential hash. Please retry Submit claim.",
-      });
+
+    if (stored.toLowerCase() !== credHash.toLowerCase()) {
       throw new Error(
-        `Credential hash mismatch. On-chain: ${stored} but you entered: ${credentialHash}. I auto-loaded the on-chain value for you; click Submit claim again.`
+        "Credential sync failed: on-chain hash does not match your application witness. Re-open in the browser used for first submission."
       );
     }
-    const used = await registryRead.nullifierUsed(nullifierHash);
+
+    const used = await registryRead.nullifierUsed(nullifier);
     if (used) {
-      throw new Error("This nullifierHash is already used. Change it (must be unique per claim).");
+      throw new Error("This claim was already submitted (nullifier used).");
     }
 
     const gateRead = gateContract(ethers, readProvider);
     const epochNum = BigInt(epoch || "0");
-    if (!ACADEMIC_YEARS.map(String).includes(String(epoch))) {
-      throw new Error(`Pick a valid academic year: ${ACADEMIC_YEARS.join(", ")}.`);
+    const yearsOk = selectableAcademicYears.map(String);
+    if (!yearsOk.includes(String(epoch))) {
+      throw new Error(`Select a valid academic year: ${yearsOk.join(", ")}.`);
     }
-    const alreadyEpoch = await gateRead.claimed(subjectId, BigInt(policyId), epochNum);
+    const alreadyEpoch = await gateRead.claimed(sid, BigInt(claimPolicyId), epochNum);
     if (alreadyEpoch) {
-      throw new Error(`You already claimed for academic year ${epoch}. Select ${Number(epoch) + 1} or another open year.`);
+      throw new Error(`You already claimed for academic year ${epoch}.`);
     }
 
-    setStatus("Generating ZK proof in browser… (this can take a bit)");
-    setToast({ tone: "loading", title: "Generating proof", message: "Creating a Groth16 proof in your browser..." });
+    setStatus("Generating ZK proof in browser… (30–90 sec)");
+    setToast({ tone: "loading", title: "Generating proof", message: "Creating Groth16 proof in your browser…" });
 
-    const bundle = await buildZkBundleForClaim(epoch);
-    const myApp =
-      myApplications.find((a) => a.status === "issued") ||
-      myApplications.find((a) => a.credentialHash) ||
-      null;
+    const myApp = issuedAppForEpoch || pickPrimaryIssuedApp(myApplications);
     let pathElements = myApp?.merklePathElements;
     let pathIndices = myApp?.merklePathIndices;
     let rootHex = myApp?.merkleRoot || merkleRoot;
 
+    const proofCredHash = bundle.credentialHash;
+
     if (!pathElements?.length) {
       const merkleState = await syncMerkleFromServer(PINATA_PROXY_URL);
-      const leafField = bytes32ToBigInt(bundle.credentialHash).toString();
-      const leafIdx = merkleState.findIndex((l) => String(l) === leafField || String(l).toLowerCase() === bundle.credentialHash.toLowerCase());
+      const leafField = bytes32ToBigInt(proofCredHash).toString();
+      const leafIdx = merkleState.findIndex(
+        (l) => String(l) === leafField || String(l).toLowerCase() === proofCredHash.toLowerCase()
+      );
       if (leafIdx < 0) {
         throw new Error("Merkle proof not found. Ask issuer to re-issue or sync applications.");
       }
@@ -1244,10 +1462,15 @@ export default function App() {
 
     const readReg = registryContract(ethers, readProvider);
     const onChainRoot = await readReg.merkleRoot();
-    if (onChainRoot && onChainRoot !== "0x0000000000000000000000000000000000000000000000000000000000000000") {
+    if (onChainRoot && onChainRoot !== ZERO_HASH32) {
       rootHex = onChainRoot;
     }
     setMerkleRoot(rootHex);
+
+    const pe = [...pathElements].map((x) => BigInt(x).toString());
+    const pi = [...pathIndices].map((x) => String(x));
+    while (pe.length < 4) pe.push("0");
+    while (pi.length < 4) pi.push("0");
 
     const input = {
       income: bundle.income,
@@ -1257,12 +1480,12 @@ export default function App() {
       domicileMH: bundle.domicileMH,
       incomeCertHash: bundle.incomeCertHash,
       casteCertHash: bundle.casteCertHash,
-      merklePathElements: pathElements,
-      merklePathIndices: pathIndices,
+      merklePathElements: pe.slice(0, 4),
+      merklePathIndices: pi.slice(0, 4),
       subjectId: BigInt(bundle.subjectId).toString(),
-      credentialHash: BigInt(bundle.credentialHash).toString(),
+      credentialHash: BigInt(proofCredHash).toString(),
       nullifierHash: BigInt(bundle.nullifierHash).toString(),
-      policyId: BigInt(policyId).toString(),
+      policyId: BigInt(claimPolicyId).toString(),
       epoch: BigInt(epoch || "0").toString(),
       incomeCommitment: bundle.incomeCommitment,
       merkleRoot: BigInt(rootHex).toString(),
@@ -1390,10 +1613,12 @@ export default function App() {
       casteCertCid: oneTimeDocs.casteCert?.cid || "",
       caste: studentProfile?.casteCategory || "OPEN",
       domicileMH: studentProfile?.domicileMH !== false,
+      walletAddress: account,
     });
     setSubjectId(zkBundle.subjectId);
     setCredentialHash(zkBundle.credentialHash);
     setIncomeCommitmentHex(zkBundle.incomeCommitment);
+    saveWitnessSnapshot(account, epoch || defaultAcademicYear(), zkBundle, { policyId });
     saveFirstAdmissionBaseline({
       casteCertCid: oneTimeDocs.casteCert?.cid || "",
       caste: studentProfile?.casteCategory,
@@ -1467,14 +1692,14 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-full bg-gradient-to-b from-sky-50 via-white to-white text-slate-900">
+    <div className="min-h-full md-app-bg text-slate-900">
       <div className="pointer-events-none fixed right-4 top-4 z-50 flex w-full max-w-md flex-col gap-3">
         {toast ? <Toast {...toast} onClose={() => setToast(null)} /> : null}
       </div>
-      <div className="border-b border-slate-200 bg-white/80 backdrop-blur">
+      <div className="border-b border-slate-200/80 bg-white/90 shadow-sm backdrop-blur">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-600 text-white">
+            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-700 text-white shadow-md">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M12 2l8 4v6c0 5-3.5 9.5-8 10-4.5-.5-8-5-8-10V6l8-4z" fill="currentColor" opacity="0.9"/>
                 <path d="M12 6v12" stroke="white" strokeWidth="2" opacity="0.9"/>
@@ -1494,64 +1719,22 @@ export default function App() {
       </div>
 
       <div className="mx-auto max-w-6xl px-4 py-8">
-        {!role ? (
-          <div className="mx-auto max-w-3xl">
-            <div className="rounded-3xl border border-slate-200 bg-white p-8 shadow-sm">
-              <div className="text-sm font-semibold text-blue-700">ZK‑Samvidhan</div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Select portal access</div>
-              <div className="mt-2 text-slate-600">
-                Credential-based verification: PDFs reviewed privately → on-chain credential → Groth16 claim without re-uploading documents.
-              </div>
-              <div className="mt-4">
-                <ZkArchitecturePanel />
-              </div>
-
-              <div className="mt-6 grid gap-4 md:grid-cols-2">
-                <div className="rounded-2xl border border-slate-200 bg-white p-5">
-                  <div className="text-lg font-semibold text-slate-900">Citizen</div>
-                  <div className="mt-1 text-sm text-slate-600">
-                    Hold a credential; each year generate a ZK proof (eligible category, income under limit, same student) — not raw PDFs.
-                  </div>
-                  <div className="mt-4">
-                    <Button onClick={() => chooseRole("citizen")}>Continue as Citizen</Button>
-                  </div>
-                </div>
-
-                <div className="rounded-2xl border border-slate-200 bg-white p-5">
-                  <div className="text-lg font-semibold text-slate-900">Issuer</div>
-                  <div className="mt-1 text-sm text-slate-600">
-                    Verify PDFs off-chain; publish hash credentials + Merkle root on-chain (admin/issuer wallet).
-                  </div>
-                  <div className="mt-4">
-                    <Button onClick={() => chooseRole("issuer")}>Continue as Issuer</Button>
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-6 text-xs text-slate-500">
-                Your selection only affects the screens shown in this portal.
-              </div>
-            </div>
-          </div>
-        ) : null}
+        {!role ? <LandingPage onChooseRole={chooseRole} /> : null}
 
         {role ? (
-        <div className="flex flex-col gap-2">
-          <div className="text-sm font-medium text-blue-700">ZK‑Samvidhan</div>
-          <div className="text-3xl font-semibold tracking-tight">
-            Privacy‑Preserving Eligibility Proofs on <span className="text-blue-700">MST Testnet</span>
+        <div className="md-card overflow-hidden p-0">
+          <div className="bg-gradient-to-r from-blue-800 to-indigo-800 px-6 py-5 text-white">
+            <div className="text-sm font-medium text-blue-100">ZK‑Samvidhan · {role === "citizen" ? "Student portal" : "Issuer desk"}</div>
+            <div className="mt-1 text-2xl font-bold tracking-tight md:text-3xl" style={{ fontFamily: "Roboto Slab, serif" }}>
+              Privacy‑preserving scholarships on MST
+            </div>
+            <p className="mt-2 max-w-2xl text-sm text-blue-50/90">
+              Verify once · credential on-chain · yearly ZK claim without re-uploading documents.
+            </p>
           </div>
-          <div className="text-slate-600">
-            Verifiable credentials on MST: institute verifies PDFs privately, issues hash credentials on-chain, students claim yearly with Groth16 — no document re-upload.
+          <div className="border-t border-slate-100 bg-slate-50/50 px-4 py-3">
+            <LiveDeploymentBar pinataProxyUrl={PINATA_PROXY_URL} persistence={backendPersistence} pinataOk={backendPinataOk} />
           </div>
-          <div className="mt-3 max-w-4xl">
-            <ZkArchitecturePanel compact />
-          </div>
-          <LiveDeploymentBar
-            pinataProxyUrl={PINATA_PROXY_URL}
-            persistence={backendPersistence}
-            pinataOk={backendPinataOk}
-          />
         </div>
         ) : null}
 
@@ -2206,7 +2389,7 @@ export default function App() {
                           onChange={(e) => setEpoch(e.target.value)}
                           className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
                         >
-                          {ACADEMIC_YEARS.map((y) => (
+                          {selectableAcademicYears.map((y) => (
                             <option key={y} value={String(y)}>
                               AY {y - 1}-{y} (epoch {y})
                             </option>
@@ -2214,7 +2397,13 @@ export default function App() {
                         </select>
                       </Field>
                     </div>
-                    {hasIssuedCredential ? (
+                    {needsFirstClaim ? (
+                      <div className="mt-3 rounded-xl border border-blue-200 bg-blue-50 p-4 text-sm text-slate-800">
+                        <strong>First ZK claim</strong> — your institute issued the credential for AY {firstIssueYear}. Continue to{" "}
+                        <strong>ZK claim</strong> (no renewal yet).
+                      </div>
+                    ) : null}
+                    {showRenewalUI ? (
                       <div className="mt-3 space-y-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-slate-800">
                         <div>
                           <strong>Annual renewal (AY {epoch})</strong> — upload only a new <strong>income certificate</strong> and
@@ -2269,7 +2458,11 @@ export default function App() {
                       </Button>
                       <Button
                         type="button"
-                        onClick={() => setCitizenStep(hasIssuedCredential ? 5 : 2)}
+                        onClick={() => {
+                          if (needsFirstClaim) setCitizenStep(6);
+                          else if (hasIssuedCredential) setCitizenStep(5);
+                          else setCitizenStep(2);
+                        }}
                       >
                         Next →
                       </Button>
@@ -2487,19 +2680,7 @@ export default function App() {
                       />
                     </div>
                     <div className="mt-4 flex flex-wrap gap-2">
-                      <Button
-                        variant="secondary"
-                        onClick={() => {
-                          const miss = validateProfileForApply(studentProfile);
-                          if (miss.length) {
-                            setError(`Complete profile (Step 3): ${miss.join(", ")}`);
-                            setCitizenStep(2);
-                            return;
-                          }
-                          setShowPrintPreview(true);
-                          printApplicationPreview();
-                        }}
-                      >
+                      <Button variant="secondary" onClick={openPrintPreview}>
                         Preview / Print application
                       </Button>
                       <Button
@@ -2522,19 +2703,6 @@ export default function App() {
                       </Button>
                     </div>
                   </div>
-                ) : null}
-
-                {showPrintPreview && !hasIssuedCredential ? (
-                  <ApplicationPrint
-                    profile={studentProfile}
-                    account={account}
-                    epoch={epoch}
-                    scheme={selectedMahadbtScheme}
-                    incomeCertCid={incomeCertCid}
-                    casteCertCid={casteCertCid}
-                    oneTimeDocs={oneTimeDocs}
-                    applicationSnapshotCid={applicationSnapshotCid}
-                  />
                 ) : null}
 
                 {citizenStep === 5 ? (
@@ -2590,106 +2758,126 @@ export default function App() {
                 ) : null}
 
                 {citizenStep === 6 ? (
-                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <div className="text-xs font-medium uppercase tracking-wide text-slate-600">
-                      Step 7 — {hasIssuedCredential ? "Annual ZK claim" : "ZK claim"}
+                  <div className="md-card-flat p-5 md:p-6">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div>
+                        <div className="text-xs font-semibold uppercase tracking-wide text-blue-800">
+                          {hasIssuedCredential ? "Annual ZK claim" : "ZK claim"}
+                        </div>
+                        <div className="mt-1 text-lg font-semibold text-slate-900">Prove eligibility for AY {epoch}</div>
+                        <p className="mt-1 text-sm text-slate-600">
+                          Groth16 in your browser — no PDF upload. Institute credential + local secrets only.
+                        </p>
+                      </div>
+                      <img
+                        src="/zk-claim-illustration.svg"
+                        alt=""
+                        className="h-20 w-20 opacity-90"
+                        onError={(e) => {
+                          e.currentTarget.style.display = "none";
+                        }}
+                      />
                     </div>
-                    <div className="mt-2 grid gap-3 md:grid-cols-2">
-                      <Field label="Academic year (selected earlier)">
-                        <Input value={`AY ${Number(epoch) - 1}-${epoch} (epoch ${epoch})`} disabled />
+
+                    <div className="mt-4">
+                      <ClaimStatusCard
+                        hasIssuedCredential={hasIssuedCredential}
+                        canClaim={canClaimForYear}
+                        alreadyClaimed={alreadyClaimedEpoch}
+                        epoch={epoch}
+                        issuedAppYear={issuedAppForEpoch?.applicationYear}
+                        onRefresh={() => refreshCitizenCredentialState().catch((e) => setError(String(e?.message || e)))}
+                      />
+                    </div>
+
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                      <Field label="Academic year">
+                        <Input value={`AY ${Number(epoch) - 1}–${epoch}`} disabled />
                       </Field>
-                      <Field label="Scheme threshold (public, from policy)">
+                      <Field label="Income limit (₹)">
                         <Input value={threshold} disabled />
                       </Field>
                     </div>
-                    <ZkArchitecturePanel compact />
-                    <div className="mt-3 rounded-xl border border-violet-200 bg-violet-50/80 p-3 text-sm text-slate-800">
-                      <strong>Groth16 claim (real ZK):</strong> your browser builds a proof from secrets stored locally plus the institute-issued credential.{" "}
-                      <strong>No PDFs</strong> are sent in this step. Income amount, caste, domicile, and document hashes stay in the{" "}
-                      <em>private witness</em>; the chain checks the proof and only sees the 7 public fields below.
-                    </div>
-                    <ZkClaimProofChecklist />
-                    <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-slate-700">
-                      {hasIssuedCredential ? (
-                        <>
-                          <strong>Renewal:</strong> you already uploaded new income for AY {epoch} in Step 2; the institute re-issued your credential. This claim proves eligibility for {epoch} without sending caste/ration/domicile/CAP/admission files again.
-                        </>
-                      ) : (
-                        <>
-                          After the institute issues your credential, one claim per academic year. Exact income (₹) is not published on-chain — only <code className="rounded bg-white px-1">incomeCommitment</code>.
-                        </>
-                      )}
-                    </div>
-                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-600">
-                      {ACADEMIC_YEARS.map((y) => (
+
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {selectableAcademicYears.map((y) => (
                         <span
                           key={y}
-                          className={`rounded-full px-2 py-0.5 border ${
-                            claimedEpochs[y] ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-slate-50 border-slate-200"
-                          }`}
+                          className={`md-chip ${claimedEpochs[y] ? "md-chip-success" : "md-chip-muted"}`}
                         >
                           {y}: {claimedEpochs[y] ? "claimed" : "open"}
                         </span>
                       ))}
                     </div>
-                    <div className="mt-3 flex flex-wrap items-center gap-2">
-                      <Button
-                        variant="secondary"
-                        type="button"
-                        onClick={async () => {
-                          try {
-                            const h = await generateCredentialHashFromInputs();
-                            setStatus("Generated scholarship credential hash (must match issuer-issued hash).");
-                            copyText(h).catch(() => {});
-                          } catch (e) {
-                            setError(String(e?.message || e));
-                          }
-                        }}
-                      >
-                        Auto hash
+
+                    {advanced ? (
+                      <div className="mt-4 space-y-3">
+                        <ZkClaimProofChecklist />
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            variant="secondary"
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                const h = await generateCredentialHashFromInputs();
+                                setStatus("Credential hash generated.");
+                                copyText(h).catch(() => {});
+                              } catch (e) {
+                                setError(String(e?.message || e));
+                              }
+                            }}
+                          >
+                            Auto hash
+                          </Button>
+                          <Button
+                            variant="secondary"
+                            type="button"
+                            onClick={async () => {
+                              const n = await generateNewNullifier();
+                              setStatus("Nullifier generated.");
+                              copyText(n).catch(() => {});
+                            }}
+                          >
+                            New nullifier
+                          </Button>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(needsFirstClaim ? 1 : 5)}>
+                        ← Back
                       </Button>
                       <Button
-                        variant="secondary"
+                        size="lg"
                         type="button"
-                        onClick={async () => {
-                          const n = await generateNewNullifier();
-                          setStatus("Generated one-time nullifier for this academic year.");
-                          copyText(n).catch(() => {});
-                        }}
-                      >
-                        New nullifier
-                      </Button>
-                      <Button
-                        type="button"
+                        className="w-full sm:w-auto min-w-[240px]"
                         onClick={() =>
                           generateProofAndClaim()
                             .then(() => setCitizenStep(7))
                             .catch((e) => setError(String(e?.message || e)))
                         }
-                        disabled={!canClaimForYear || claimedEpochs[Number(epoch)]}
+                        disabled={!canClaimForYear}
                         title={
-                          !hasIssuedCredential
-                            ? "Claim is enabled only after the institute issues your credential."
-                            : !canClaimForYear
-                              ? `Submit and get institute approval for ${epoch} income first`
-                              : claimedEpochs[Number(epoch)]
-                                ? `You already claimed for ${epoch}.`
-                                : undefined
+                          alreadyClaimedEpoch
+                            ? `Already claimed for ${epoch}`
+                            : !hasIssuedCredential
+                              ? "Wait for institute to issue your credential on-chain"
+                              : !account
+                                ? "Connect wallet first"
+                                : "Generate proof and submit claim (30–90 sec)"
                         }
                       >
-                        Submit annual claim ({epoch})
+                        {alreadyClaimedEpoch ? `Claimed for ${epoch}` : `Claim scholarship — AY ${epoch}`}
                       </Button>
                     </div>
-                    <div className="mt-2 text-xs text-slate-600">
-                      Uses ZK files from <code className="rounded bg-white/10 px-1 py-0.5">/public/zk</code> and submits on-chain.
-                    </div>
-                    <div className="mt-4 flex items-center justify-between">
-                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(5)}>
-                        ← Back
-                      </Button>
-                      <Button variant="secondary" type="button" onClick={() => setCitizenStep(7)}>
-                        Skip to status →
-                      </Button>
+                    <p className="mt-2 text-center text-xs text-slate-500 sm:text-right">
+                      Proof generation runs locally; only the ZK proof is sent on-chain.
+                    </p>
+                    <div className="mt-3 flex justify-end">
+                      <button type="button" className="text-sm text-blue-700 hover:underline" onClick={() => setCitizenStep(7)}>
+                        View status →
+                      </button>
                     </div>
                   </div>
                 ) : null}
@@ -2787,6 +2975,18 @@ export default function App() {
           </div>
         ) : null}
       </div>
+
+      <PrintPreviewModal open={showPrintPreview} onClose={() => setShowPrintPreview(false)}>
+        <ApplicationPrintSheet
+          profile={studentProfile}
+          account={account}
+          epoch={epoch}
+          scheme={selectedMahadbtScheme}
+          incomeCertCid={incomeCertCid}
+          oneTimeDocs={oneTimeDocs}
+          applicationSnapshotCid={applicationSnapshotCid}
+        />
+      </PrintPreviewModal>
     </div>
   );
 }

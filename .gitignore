@@ -19,3 +19,5 @@ circuits/**/*.vkey.json
 deployments/
 
 server/data/applications.json
+
+.vercel

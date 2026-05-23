@@ -1,0 +1,13 @@
+node_modules
+artifacts
+cache
+coverage
+circuits
+contracts
+deployments
+scripts
+docs
+*.md
+.git
+frontend/node_modules
+server/node_modules
