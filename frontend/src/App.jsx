@@ -492,7 +492,7 @@ export default function App() {
   const [citizenStep, setCitizenStep] = useState(0);
   const [studentProfile, setStudentProfile] = useState(() => {
     try {
-      const s = localStorage.getItem("zk_student_profile");
+      const s = localStorage.getItem("zk_student_profile_v2");
       return s ? { ...DEFAULT_STUDENT_PROFILE, ...JSON.parse(s) } : { ...DEFAULT_STUDENT_PROFILE };
     } catch {
       return { ...DEFAULT_STUDENT_PROFILE };
@@ -781,7 +781,7 @@ export default function App() {
   );
 
   useEffect(() => {
-    localStorage.setItem("zk_student_profile", JSON.stringify(studentProfile));
+    localStorage.setItem("zk_student_profile_v2", JSON.stringify(studentProfile));
   }, [studentProfile]);
 
   useEffect(() => {
