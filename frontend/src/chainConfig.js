@@ -9,7 +9,8 @@ const DEFAULT_VERIFIER_V2 = "0xb96dE41d804bb6ef6482DDC54b512cBdd6868aD5";
 export const MST_RPC_URL = "https://testnetrpc.mstblockchain.com";
 export const MST_EXPLORER = "https://testnet.mstscan.com";
 export const MST_CHAIN_ID_DEC = 91562037;
-export const MST_CHAIN_ID_HEX = "0x05752B65";
+/** MetaMask requires unpadded hex (no leading zeros after 0x). */
+export const MST_CHAIN_ID_HEX = `0x${MST_CHAIN_ID_DEC.toString(16)}`;
 
 export const REGISTRY_ADDRESS =
   import.meta.env.VITE_REGISTRY_ADDRESS || DEFAULT_REGISTRY_V2;
